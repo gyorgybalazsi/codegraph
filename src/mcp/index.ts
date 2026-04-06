@@ -116,6 +116,14 @@ export class MCPServer {
     try {
       this.cg = await CodeGraph.open(resolvedRoot);
       this.toolHandler.setDefaultCodeGraph(this.cg);
+
+      // Initialize embeddings for semantic search
+      try {
+        await this.cg.initializeEmbeddings();
+      } catch (embErr) {
+        const msg = embErr instanceof Error ? embErr.message : String(embErr);
+        process.stderr.write(`[CodeGraph MCP] Embedding init failed (semantic search unavailable): ${msg}\n`);
+      }
     } catch (err) {
       // Log the error so transient failures are diagnosable (see issue #47)
       const msg = err instanceof Error ? err.message : String(err);

@@ -406,6 +406,21 @@ export class CodeGraph {
               total,
             });
           });
+
+          // Generate embeddings for semantic search
+          try {
+            await this.initializeEmbeddings();
+            await this.generateEmbeddings((progress) => {
+              options.onProgress?.({
+                phase: 'embedding',
+                current: progress.current,
+                total: progress.total,
+              });
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`[CodeGraph] Embedding generation failed: ${msg}\n`);
+          }
         }
 
         return result;
@@ -486,6 +501,21 @@ export class CodeGraph {
                 total,
               });
             });
+          }
+
+          // Generate embeddings for new/changed nodes
+          try {
+            await this.initializeEmbeddings();
+            await this.generateEmbeddings((progress) => {
+              options.onProgress?.({
+                phase: 'embedding',
+                current: progress.current,
+                total: progress.total,
+              });
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`[CodeGraph] Embedding generation failed: ${msg}\n`);
           }
         }
 
