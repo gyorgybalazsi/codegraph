@@ -121,11 +121,11 @@ codegraph-rs/
 CLI -> config::load
     -> extraction::walker      (iterate workspace roots, find source files)
     -> extraction::parser      (rayon: parse each file with tree-sitter)
-    -> raw {nodes, structural_edges, unresolved_refs}
+    -> ExtractionResult{ nodes, edges, unresolved_refs }
     -> db::write_extraction    (Cypher UNWIND/MERGE for nodes + UnresolvedRef
-                                + structural edges: CONTAINS, EXTENDS,
-                                IMPLEMENTS produced directly from AST)
-    -> resolution              (UnresolvedRefs -> CALLS, IMPORTS-targets,
+                                + structural edges: CONTAINS, HAS_REF, EXTENDS,
+                                IMPLEMENTS, EXPORTS produced directly from AST)
+    -> resolution              (UnresolvedRefs -> IMPORTS, then CALLS,
                                 REFERENCES, TYPE_OF — derived from
                                 UnresolvedRef records, not extraction)
     -> db::write_resolution    (resolution-produced edges in batches)
@@ -133,8 +133,8 @@ CLI -> config::load
 ```
 
 Edges fall into two cleanly separated buckets:
-- **Structural edges** (produced by extraction, derivable from a single file's AST): `CONTAINS`, `EXTENDS`, `IMPLEMENTS`, `EXPORTS`, `INSTANTIATES`, `DECORATES`, `OVERRIDES`, `RETURNS`, `TYPE_OF` (when the type is in the same file).
-- **Resolution-derived edges** (produced by resolution from `UnresolvedRef` records, may cross files): `CALLS`, `IMPORTS` (target side), `REFERENCES`, cross-file `TYPE_OF`.
+- **Structural edges** (produced by extraction, derivable from a single file's AST): `CONTAINS`, `HAS_REF`, `EXTENDS`, `IMPLEMENTS`, `EXPORTS`, `INSTANTIATES`, `DECORATES`, `OVERRIDES`, `RETURNS`, `TYPE_OF` (when the type is in the same file).
+- **Resolution-derived edges** (produced by resolution from `UnresolvedRef` records, may cross files; carry the `confidence` property): `CALLS`, `IMPORTS`, `REFERENCES`, cross-file `TYPE_OF`.
 
 ### Query dataflow
 
@@ -160,16 +160,24 @@ Every code node gets two labels: `Symbol` (supertype) plus its specific kind. `(
 
 The word "module" in this spec means the Neo4j label `Module` (a graph node) unless preceded by a language qualifier like "Rust module" or "Daml module."
 
-| Kind label | Use |
-|---|---|
-| `File` | A source file |
-| `Module`, `Namespace` | Container |
-| `Function`, `Method` | Callable |
-| `Class`, `Struct`, `Interface`, `Trait`, `Enum`, `TypeAlias` | Types (v1: only `Struct`, `Trait`, `Enum`, `TypeAlias` produced; others reserved for future languages) |
-| `Property`, `Field`, `Variable`, `Constant`, `Parameter`, `EnumMember` | Values |
-| `Import`, `Export` | Module boundaries |
-| `UnresolvedRef` | Permanent record of an unresolved name reference (see §7) |
-| `Template`, `Choice` | Daml-specific (reserved; populated only when `tree-sitter-daml` ships) |
+| Kind label | Use | v1 produces? |
+|---|---|---|
+| `File` | A source file | yes |
+| `Module` | Rust module / Daml module / Haskell module | yes |
+| `Namespace` | Reserved for languages with namespace constructs | no |
+| `Function` | Top-level callable | yes |
+| `Method` | Callable attached to a type (Rust impl methods, Daml class methods) | yes |
+| `Struct` | Product type (Rust `struct`, Daml `data` record-like) | yes |
+| `Trait` | Rust `trait` | yes |
+| `Enum` | Sum type (Rust `enum`, Daml `data` ADT) | yes |
+| `TypeAlias` | Rust `type T = ...`, Daml `type T = ...` | yes |
+| `Class`, `Interface` | Reserved for future languages (Java, Python, etc.) | no |
+| `Variable`, `Constant`, `Parameter`, `Field` | Values | yes (where extracted) |
+| `Property`, `EnumMember` | Reserved | no |
+| `Import` | Source-side import statement (Rust `use`, Daml `import`) | yes |
+| `Export` | Symbol exported from a module (Rust `pub use`, Daml export list) | yes |
+| `UnresolvedRef` | Permanent record of an unresolved name reference (see §7) | yes |
+| `Template`, `Choice` | Daml-specific (reserved; populated only when `tree-sitter-daml` ships) | no |
 
 **Note on `impl` blocks (Rust) and instance declarations (Daml/Haskell):** v1 does NOT emit a separate `Impl` node. Methods inside `impl Foo { fn bar() }` are emitted as `Method` nodes whose `qualified_name` carries the type prefix (`crate::module::Foo::bar`), and whose `CONTAINS` parent is the source file. The type-to-method relationship is captured implicitly by the `qualified_name` and can be derived by querying for methods whose `qualified_name` starts with `<TypeQualName>::`.
 
@@ -262,7 +270,7 @@ Edges may carry small property sets. v1 uses:
 
 | Edge type | Property | Values | Meaning |
 |---|---|---|---|
-| `CALLS`, `REFERENCES`, `TYPE_OF` (etc., resolution-produced) | `confidence` | `"import_resolved"` \| `"name_match"` | How the resolver derived this edge (see §7) |
+| `CALLS`, `IMPORTS`, `REFERENCES`, `TYPE_OF` (resolution-derived edges) | `confidence` | `"import_resolved"` \| `"name_match"` | How the resolver derived this edge (see §7). The presence of `confidence` is the marker the resolution rebuild uses to find edges to drop |
 
 Other edge types carry no properties in v1.
 
@@ -286,6 +294,18 @@ This relies on Neo4j Enterprise Edition for multi-database support, which is wha
 ### Database creation and privileges
 
 `codegraph-rs init` (and `codegraph-rs index` if the database does not yet exist) issues `CREATE DATABASE <name> IF NOT EXISTS` against Neo4j's `system` database. This requires the configured Neo4j user to have the `CREATE DATABASE` privilege. The Neo4j Desktop default `neo4j` admin user has this privilege; users with restricted accounts must either grant the privilege or pre-create the database manually.
+
+### `init` order of operations
+
+`codegraph-rs init` is fail-fast: it does *not* leave half-initialized state on disk if Neo4j setup fails. Sequence:
+
+1. Read or prompt for Neo4j details (URI, username, password).
+2. Open a Bolt connection. On failure → print error, exit nonzero, write nothing.
+3. Issue `CREATE DATABASE <name> IF NOT EXISTS` and verify the database is reachable. On failure (typically missing privilege) → print actionable error, exit nonzero, write nothing.
+4. Apply the schema constraints and indexes from §4 to the new database.
+5. Only now: write `<workspace_dir>/.codegraph/config.toml` and `<workspace_dir>/.codegraph/secrets.toml`. Add `secrets.toml` to a fresh `.gitignore` if one doesn't already cover it.
+
+`init` operates on the directory passed via `--workspace`, defaulting to cwd. The upward `.codegraph/` discovery (used by `index`, `sync`, `serve`, `query`, `status`) does not apply to `init` — `init` creates the directory it's pointed at, not an ancestor's.
 
 ### Database naming
 
@@ -329,7 +349,7 @@ languages = ["rust", "daml"]     # optional whitelist; default: all detected
 
 [embeddings]
 enabled = true
-model = "bge-small-en-v1.5"      # only valid value in v1
+model = "bge-small-en-v1.5"      # field exists for forward-compat; v1 accepts only this value
 ```
 
 Custom file-pattern excludes go in `<workspace_dir>/.codegraph/.codegraphignore`, which uses gitignore syntax. There is no inline TOML escape hatch — keeping all ignore rules in one place avoids confusion about precedence.
@@ -449,14 +469,20 @@ An `UnresolvedRef` is connected to its source by `(source)-[:HAS_REF]->(:Unresol
 
 Resolution runs **after all files are extracted/written**, so every candidate target exists. During incremental sync, resolution runs after the changed/added/deleted files have been processed.
 
-### Two-stage resolver
+Resolution is itself ordered, because some stages depend on edges produced by earlier stages:
 
-**Stage 1 — Import-driven (high confidence)**
+1. **Phase A — Resolve imports.** Process every `UnresolvedRef` with `kind="import"`. For each, look up the named module in the workspace and create the `IMPORTS` edge. This phase has no dependencies on other resolution outputs.
+2. **Phase B — Stage 1 (import-driven) for non-imports.** With `IMPORTS` edges now present, process `UnresolvedRef`s of `kind="call" | "type_ref" | "reference"`.
+3. **Phase C — Stage 2 (name-match fallback) for whatever Phase B did not resolve.**
 
-For each `UnresolvedRef`:
-1. Look at the source file's `IMPORTS` edges.
-2. Walk from each imported module/file to its `EXPORTS` or `CONTAINS` children.
-3. Match by name. If exactly one candidate → create a resolution edge of the appropriate type (`CALLS` for `kind="call"`, etc.) from `source_qid` to the candidate, with `confidence: "import_resolved"`.
+### Stage 1 — Import-driven (Phase B, high confidence)
+
+For each non-import `UnresolvedRef`:
+1. Look at the source file's `IMPORTS` edges (created in Phase A).
+2. From each imported `Module`, gather candidates via:
+   - `(:Module)-[:CONTAINS]->(candidate)` — symbols defined directly in the module.
+   - `(:Module)-[:EXPORTS]->(candidate)` — symbols re-exported by the module (e.g., Rust `pub use`).
+3. Match by name. If exactly one candidate → create a resolution edge of the appropriate type (`CALLS` for `kind="call"`, `REFERENCES` for `kind="reference"`, `TYPE_OF` for `kind="type_ref"`) from `source_qid` to the candidate, with `confidence: "import_resolved"`.
 
 Rust specifics:
 - `use crate::util::foo;` → resolves `foo` calls to `crate::util::foo`.
@@ -468,9 +494,9 @@ Daml specifics (via Haskell grammar):
 - Calls resolve through imports in scope.
 - Cross-root works naturally: both roots populate the same Neo4j database; module qualified names are globally unique.
 
-**Stage 2 — Name-match fallback (lower confidence)**
+### Stage 2 — Name-match fallback (Phase C, lower confidence)
 
-For `UnresolvedRef`s not resolved by stage 1:
+For `UnresolvedRef`s not resolved by Stage 1:
 - Exact name match against `qualified_name` across the whole workspace.
 - If exactly one candidate → resolution edge created with `confidence: "name_match"`.
 - If multiple candidates → no edge created; record candidates on the `UnresolvedRef` node:
@@ -495,15 +521,20 @@ A Daml file under `splice/` with `import Utility.Foo` must resolve to a module i
 
 `codegraph-rs index` and `codegraph-rs sync` invoke the same resolution routine. The routine:
 
-1. Drops all existing edges with a `confidence` property:
+1. Drops all existing resolution-derived edges, restricted by relationship type (Neo4j has type-level indexes; the predicate filters by `confidence` to avoid touching any non-resolution edges that may share a type in the future):
    ```cypher
-   MATCH ()-[r WHERE r.confidence IS NOT NULL]-()
+   MATCH ()-[r:CALLS|IMPORTS|REFERENCES|TYPE_OF]->()
+   WHERE r.confidence IS NOT NULL
    DELETE r
    ```
-2. Walks every `UnresolvedRef` and applies stages 1 then 2.
-3. Updates `unresolved_reason` and `candidate_qids` on each ref accordingly.
+2. Resets `candidate_qids` and `unresolved_reason` on every `UnresolvedRef` node so stale state doesn't carry over.
+3. Runs Phase A → Phase B → Phase C from "Order" above.
 
 Because `UnresolvedRef`s are permanent, resolution is idempotent — running it twice produces the same edges.
+
+### `UnresolvedRef.qid` stability note
+
+`UnresolvedRef.qid` includes `<line>:<col>`, which would normally make it position-dependent. This is intentional and safe because **`UnresolvedRef`s are always co-created and co-deleted with their source `Symbol`** — they never need to survive a position shift. When file A is re-extracted, all of A's previous `UnresolvedRef`s are deleted via `HAS_REF` cascade and a fresh set is emitted. No external graph state references `UnresolvedRef.qid` directly.
 
 ### Performance
 
@@ -590,7 +621,7 @@ Neo4j stores 384-dim float32 vectors inline. ~1.5 KB per embedded symbol. A 50k-
 ### Not in v1
 
 - Embedding of full function bodies.
-- Custom or alternate models (config supports `model = "..."` but only one valid value).
+- Accepting any embedding model other than `bge-small-en-v1.5`. The config field is reserved for forward compat; v1 rejects other values.
 - Cross-encoder reranking.
 
 ## 9. Sync (incremental updates)
@@ -679,6 +710,13 @@ A Claude Code session does not know any `qid` values up front. The expected patt
 ### Tool surface
 
 All prefixed `codegraph_rs_` so they coexist with the TS-version tools without naming collision in Claude Code.
+
+Common parameter conventions:
+- `qid: string` — a `Symbol` qid as defined in §4.
+- `root: string` — a workspace root **`name`** as declared in `[[workspace.roots]]` (e.g., `"splice"`), not a filesystem path.
+- `kinds: string[]` — values from the kind-label table in §4 (e.g., `["Function", "Method"]`).
+- `depth: number` — graph traversal hop limit; default 2 unless noted.
+- `limit: number` — result count cap; default 10 for searches, larger for context tools.
 
 | Tool | Inputs | Returns |
 |---|---|---|
