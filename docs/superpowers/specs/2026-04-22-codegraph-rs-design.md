@@ -121,12 +121,20 @@ codegraph-rs/
 CLI -> config::load
     -> extraction::walker      (iterate workspace roots, find source files)
     -> extraction::parser      (rayon: parse each file with tree-sitter)
-    -> raw {nodes, edges, unresolved_refs}
-    -> db::write               (Cypher UNWIND/MERGE batches, ~500 per batch)
-    -> resolution              (second pass: resolve unresolved refs)
-    -> db::write_edges
-    -> vectors::embed          (fastembed-rs batches; write to Neo4j vector index)
+    -> raw {nodes, structural_edges, unresolved_refs}
+    -> db::write_extraction    (Cypher UNWIND/MERGE for nodes + UnresolvedRef
+                                + structural edges: CONTAINS, EXTENDS,
+                                IMPLEMENTS produced directly from AST)
+    -> resolution              (UnresolvedRefs -> CALLS, IMPORTS-targets,
+                                REFERENCES, TYPE_OF — derived from
+                                UnresolvedRef records, not extraction)
+    -> db::write_resolution    (resolution-produced edges in batches)
+    -> vectors::embed          (fastembed-rs batches; SET embedding via Cypher)
 ```
+
+Edges fall into two cleanly separated buckets:
+- **Structural edges** (produced by extraction, derivable from a single file's AST): `CONTAINS`, `EXTENDS`, `IMPLEMENTS`, `EXPORTS`, `INSTANTIATES`, `DECORATES`, `OVERRIDES`, `RETURNS`, `TYPE_OF` (when the type is in the same file).
+- **Resolution-derived edges** (produced by resolution from `UnresolvedRef` records, may cross files): `CALLS`, `IMPORTS` (target side), `REFERENCES`, cross-file `TYPE_OF`.
 
 ### Query dataflow
 
@@ -148,17 +156,22 @@ Claude Code stdin -> mcp::transport
 
 ### Node labels
 
-Every code node gets two labels: `Symbol` (supertype) plus its specific kind. `(:Symbol:Function)` makes "any symbol" queries trivial while preserving kind-specific filtering.
+Every code node gets two labels: `Symbol` (supertype) plus its specific kind. `(:Symbol:Function)` makes "any symbol" queries trivial while preserving kind-specific filtering. **Extractors must always emit both labels** — single-label nodes are a bug.
+
+The word "module" in this spec means the Neo4j label `Module` (a graph node) unless preceded by a language qualifier like "Rust module" or "Daml module."
 
 | Kind label | Use |
 |---|---|
 | `File` | A source file |
 | `Module`, `Namespace` | Container |
 | `Function`, `Method` | Callable |
-| `Class`, `Struct`, `Interface`, `Trait`, `Protocol`, `Enum`, `TypeAlias` | Types |
+| `Class`, `Struct`, `Interface`, `Trait`, `Enum`, `TypeAlias` | Types (v1: only `Struct`, `Trait`, `Enum`, `TypeAlias` produced; others reserved for future languages) |
 | `Property`, `Field`, `Variable`, `Constant`, `Parameter`, `EnumMember` | Values |
 | `Import`, `Export` | Module boundaries |
+| `UnresolvedRef` | Permanent record of an unresolved name reference (see §7) |
 | `Template`, `Choice` | Daml-specific (reserved; populated only when `tree-sitter-daml` ships) |
+
+**Note on `impl` blocks (Rust) and instance declarations (Daml/Haskell):** v1 does NOT emit a separate `Impl` node. Methods inside `impl Foo { fn bar() }` are emitted as `Method` nodes whose `qualified_name` carries the type prefix (`crate::module::Foo::bar`), and whose `CONTAINS` parent is the source file. The type-to-method relationship is captured implicitly by the `qualified_name` and can be derived by querying for methods whose `qualified_name` starts with `<TypeQualName>::`.
 
 ### Relationship types
 
@@ -173,12 +186,13 @@ Every code node gets two labels: `Symbol` (supertype) plus its specific kind. `(
 | `TYPE_OF`, `RETURNS` | Type relationships |
 | `INSTANTIATES` | Constructor or factory invocation |
 | `DECORATES` | Decorator or attribute |
+| `HAS_REF` | From a `Symbol` to its `UnresolvedRef` records (structural; produced during extraction) |
 | `HAS_CHOICE`, `SIGNATORY`, `CONTROLLER`, `OBSERVER` | Daml-specific (reserved) |
 
 ### Common properties
 
 ```
-qid                TEXT     UNIQUE     "<root>:<rel_path>:<qualified_name>:<start_line>"
+qid                TEXT     UNIQUE     "<root>:<rel_path>:<qualified_name>[#<n>]"
 name               TEXT                short identifier
 qualified_name     TEXT                fully-qualified identifier
 root_name          TEXT                workspace root this symbol belongs to
@@ -191,6 +205,8 @@ end_col            INTEGER
 signature          TEXT NULL           callables: param + return type as text
 doc                TEXT NULL           leading doc comment if any
 embedding          LIST<FLOAT> NULL    384-dim vector (set on embed-eligible nodes)
+parse_reliable     BOOLEAN             false on Daml `template`/`choice`/`signatory`
+                                       blocks where the Haskell grammar misparses
 ```
 
 ### File-specific properties
@@ -231,7 +247,24 @@ CREATE VECTOR INDEX symbol_embedding
 
 ### Identity scheme
 
-`qid = "<root_name>:<relative_path>:<qualified_name>:<start_line>"` — deterministic, stable, cross-root-safe. On reindex, MERGE by `qid` is naturally idempotent.
+```
+qid = "<root_name>:<relative_path>:<qualified_name>[#<ordinal>]"
+```
+
+- `qualified_name` is the language-specific fully qualified identifier (e.g., `crate::util::parse_config`, `Splice.Foo.bar`, `Splice.Foo.Bar::baz` for a method on a type).
+- The `#<ordinal>` suffix is omitted unless the same `(root, relative_path, qualified_name)` triple has multiple symbols — extremely rare in Rust and Daml since both languages disallow same-name overloads at one scope. When a collision is detected during extraction, the extractor assigns `#1`, `#2`, … by source-order.
+- **`start_line` is deliberately NOT in the qid.** Including it would invalidate every downstream symbol's qid whenever a function is added above it in the same file, cascading edge invalidation across the graph. Position lives in the `start_line`/`end_line` properties only.
+- On reindex, MERGE by `qid` is naturally idempotent.
+
+### Edge properties
+
+Edges may carry small property sets. v1 uses:
+
+| Edge type | Property | Values | Meaning |
+|---|---|---|---|
+| `CALLS`, `REFERENCES`, `TYPE_OF` (etc., resolution-produced) | `confidence` | `"import_resolved"` \| `"name_match"` | How the resolver derived this edge (see §7) |
+
+Other edge types carry no properties in v1.
 
 ## 5. Workspace model and database isolation
 
@@ -250,6 +283,19 @@ One workspace maps to one Neo4j database. Database-per-workspace, not database-p
 
 This relies on Neo4j Enterprise Edition for multi-database support, which is what Neo4j Desktop installs by default — free for local development use.
 
+### Database creation and privileges
+
+`codegraph-rs init` (and `codegraph-rs index` if the database does not yet exist) issues `CREATE DATABASE <name> IF NOT EXISTS` against Neo4j's `system` database. This requires the configured Neo4j user to have the `CREATE DATABASE` privilege. The Neo4j Desktop default `neo4j` admin user has this privilege; users with restricted accounts must either grant the privilege or pre-create the database manually.
+
+### Database naming
+
+Neo4j 5 database names must:
+- be 3–63 characters,
+- start with an ASCII letter,
+- contain only ASCII letters, digits, dots, and dashes (**no underscores**, no other special characters).
+
+Spec convention for generated database names: `codegraph-<workspace-name>` with the workspace name lowercased and any non-conforming characters replaced by `-`.
+
 ### Workspace config file
 
 Canonical path: `<workspace_dir>/.codegraph/config.toml`.
@@ -266,7 +312,7 @@ name = "daml-stack"
 
 [workspace.neo4j]
 uri = "bolt://localhost:7687"
-database = "codegraph_daml_stack"
+database = "codegraph-daml-stack"   # see Database naming above
 username = "neo4j"
 # password lives in .codegraph/secrets.toml or env
 
@@ -279,13 +325,14 @@ name = "utility"
 path = "../utility"
 
 [indexing]
-languages = ["rust", "daml"]     # optional whitelist
-ignore_extra = ["target/**", ".daml/**"]
+languages = ["rust", "daml"]     # optional whitelist; default: all detected
 
 [embeddings]
 enabled = true
 model = "bge-small-en-v1.5"      # only valid value in v1
 ```
+
+Custom file-pattern excludes go in `<workspace_dir>/.codegraph/.codegraphignore`, which uses gitignore syntax. There is no inline TOML escape hatch — keeping all ignore rules in one place avoids confusion about precedence.
 
 Single-root self-host config is the obvious shrink of the above.
 
@@ -338,7 +385,7 @@ pub struct ExtractionResult {
 }
 ```
 
-- `languages/rust.rs` maps Rust AST nodes — `function_item` → `Function`, `struct_item` → `Struct`, `impl_item` → `Impl` (whose contained methods inherit the impl context), `use_declaration` → `Import`, `call_expression` → captures an `UnresolvedRef`.
+- `languages/rust.rs` maps Rust AST nodes — `function_item` → `Function`, `struct_item` → `Struct`, `enum_item` → `Enum`, `trait_item` → `Trait`, `type_item` → `TypeAlias`, `mod_item` → `Module`, `use_declaration` → `Import`, `call_expression` → captures an `UnresolvedRef`. `impl_item` is not a node itself; its methods are emitted as `Method` nodes whose `qualified_name` includes the impl'd type (`<crate>::<mod>::<Type>::<method>`) and whose `CONTAINS` parent is the source file (see §4 note on `impl` blocks).
 - `languages/daml.rs` maps Haskell-grammar nodes — `function` → `Function`, `decl/type_synonym` → `TypeAlias`, `data_type` → `Struct`, `module` → `Module`, `import` → `Import`. Templates, choices, and signatories are not extracted in v1; the Haskell grammar does not see them.
 - Each extractor uses tree-sitter `.scm` query files (capture queries) to locate interesting AST nodes declaratively rather than hand-walking.
 
@@ -351,19 +398,17 @@ pub struct ExtractionResult {
 
 ### UnresolvedRef
 
-Captures "this call/reference needs resolution":
+Captures "this call/reference needs resolution." Stored as a permanent `(:UnresolvedRef)` node connected to its source by `(:Symbol)-[:HAS_REF]->(:UnresolvedRef)`. The full schema is in §4 / §7 — extraction emits these records and never touches the resolution-derived edges that depend on them.
 
 ```rust
 pub struct UnresolvedRef {
     pub source_qid: String,         // the caller / referencer
     pub unresolved_name: String,    // "foo", "Module.foo", "crate::util::foo"
-    pub kind: UnresolvedKind,       // Call, Import, TypeRef, etc.
+    pub kind: UnresolvedKind,       // Call, Import, TypeRef, Reference
     pub line: u32,
     pub col: u32,
 }
 ```
-
-Stored as `(:UnresolvedRef)` nodes with an edge to the source, then consumed in the resolution pass.
 
 ### Error handling
 
@@ -377,22 +422,41 @@ Stored as `(:UnresolvedRef)` nodes with an edge to the source, then consumed in 
 
 ## 7. Resolution pipeline
 
-### Problem
+### Core idea: `UnresolvedRef` is the durable record of source-code intent
 
-After extraction, the graph has `Function` nodes and `UnresolvedRef` nodes. A call site that invokes `foo()` knows only the string `"foo"`. Resolution turns those into `(:Function)-[:CALLS]->(:Function)` edges.
+Every cross-symbol reference produced by extraction (a function call, an import, a type reference, etc.) is materialized as a permanent `(:UnresolvedRef)` node. These nodes are **the source of truth for what the source code says**, independent of whether the resolver currently has a target for them.
+
+Resolution-derived edges (`CALLS`, `IMPORTS`-target, `REFERENCES`, cross-file `TYPE_OF`) are **derived/cached** from `UnresolvedRef` records. They are recomputed whenever the source records or the candidate targets change.
+
+This shape makes incremental sync correct: when file B is re-extracted with potentially different `qid`s, B's `UnresolvedRef` records are deleted and re-created, but file A's `UnresolvedRef` records (which referenced symbols *in* B) are untouched. Re-running resolution recreates the cross-file edges against B's new symbols.
+
+### `UnresolvedRef` schema
+
+```
+qid                TEXT  UNIQUE  "<source_qid>:ref:<line>:<col>:<ord>"
+source_qid         TEXT          the caller / referencer
+unresolved_name    TEXT          "foo", "Module.foo", "crate::util::foo"
+kind               TEXT          "call" | "import" | "type_ref" | "reference"
+line               INTEGER
+col                INTEGER
+candidate_qids     LIST<TEXT>    set when stage-2 finds >1 candidate (else NULL)
+unresolved_reason  TEXT NULL     "no_candidate" | "ambiguous" | NULL when resolved
+```
+
+An `UnresolvedRef` is connected to its source by `(source)-[:HAS_REF]->(:UnresolvedRef)`. The `HAS_REF` edges are structural and produced during extraction. They do not require resolution.
 
 ### Order
 
-Resolution runs **after all files are extracted and written**, so every candidate target already exists in the graph.
+Resolution runs **after all files are extracted/written**, so every candidate target exists. During incremental sync, resolution runs after the changed/added/deleted files have been processed.
 
 ### Two-stage resolver
 
 **Stage 1 — Import-driven (high confidence)**
 
-For each unresolved ref:
+For each `UnresolvedRef`:
 1. Look at the source file's `IMPORTS` edges.
 2. Walk from each imported module/file to its `EXPORTS` or `CONTAINS` children.
-3. Match by name. If exactly one candidate, create the resolved edge.
+3. Match by name. If exactly one candidate → create a resolution edge of the appropriate type (`CALLS` for `kind="call"`, etc.) from `source_qid` to the candidate, with `confidence: "import_resolved"`.
 
 Rust specifics:
 - `use crate::util::foo;` → resolves `foo` calls to `crate::util::foo`.
@@ -402,28 +466,49 @@ Rust specifics:
 Daml specifics (via Haskell grammar):
 - `import Utility.Foo` → file imports module.
 - Calls resolve through imports in scope.
-- Cross-root works naturally: both roots populate the same Neo4j database, module-qualified names are globally unique.
+- Cross-root works naturally: both roots populate the same Neo4j database; module qualified names are globally unique.
 
 **Stage 2 — Name-match fallback (lower confidence)**
 
-For refs unresolved after stage 1:
-- Exact name match across the whole workspace.
-- If exactly one candidate → edge created with `confidence: "name_match"` property.
-- If multiple candidates → leave as a persistent `(:UnresolvedRef)` with all candidates recorded.
+For `UnresolvedRef`s not resolved by stage 1:
+- Exact name match against `qualified_name` across the whole workspace.
+- If exactly one candidate → resolution edge created with `confidence: "name_match"`.
+- If multiple candidates → no edge created; record candidates on the `UnresolvedRef` node:
 
-Confidence is a relationship property; queries can filter on it but most won't.
+  ```cypher
+  MATCH (r:UnresolvedRef {qid: $ref_qid})
+  SET r.candidate_qids = $candidate_qids,
+      r.unresolved_reason = 'ambiguous'
+  ```
+
+- If zero candidates → set `unresolved_reason = 'no_candidate'`.
 
 ### Cross-root module resolution
 
-Workspace has roots `splice` and `utility`. A Daml file under `splice/` with `import Utility.Foo` must resolve to a module inside `utility/`.
+A Daml file under `splice/` with `import Utility.Foo` must resolve to a module inside `utility/`.
 
-- The resolver looks up modules by their **qualified-name string** (e.g., `"Utility.Foo"`) across the full workspace, ignoring the `root_name` boundary. If exactly one `Module` node has that `qualified_name`, the import resolves there.
+- The resolver looks up modules by their **qualified-name string** (e.g., `"Utility.Foo"`) across the full workspace, ignoring `root_name` boundaries. If exactly one `Module` node has that `qualified_name`, the import resolves there.
 - The resolver does not parse `Cargo.toml` or `daml.yaml` to derive package boundaries in v1; resolution is purely on extracted qualified names.
-- Ambiguity (same `qualified_name` in two roots) → leave unresolved, log warning.
+- Ambiguity (same `qualified_name` in two roots) → recorded as ambiguous.
 
-### Cleanup
+### Resolution as idempotent rebuild
 
-After resolution completes, `(:UnresolvedRef)` nodes that produced an edge are deleted. Unresolved remainders stay (with a `reason` property) for debugging.
+`codegraph-rs index` and `codegraph-rs sync` invoke the same resolution routine. The routine:
+
+1. Drops all existing edges with a `confidence` property:
+   ```cypher
+   MATCH ()-[r WHERE r.confidence IS NOT NULL]-()
+   DELETE r
+   ```
+2. Walks every `UnresolvedRef` and applies stages 1 then 2.
+3. Updates `unresolved_reason` and `candidate_qids` on each ref accordingly.
+
+Because `UnresolvedRef`s are permanent, resolution is idempotent — running it twice produces the same edges.
+
+### Performance
+
+- v1: full global resolution pass on every `index` and `sync`. For an `UnresolvedRef` count `R`, complexity is roughly `O(R × log N)` where `N` is the candidate count per name (small in practice). Expect <2s for a 50k-symbol workspace.
+- v2 candidate optimization: scope re-resolution to refs whose source file or candidate set changed. Out of v1 scope.
 
 ### Not in v1
 
@@ -444,7 +529,7 @@ After resolution completes, `(:UnresolvedRef)` nodes that produced an edge are d
 Not every node — embedding `Variable` nodes named `i` is noise. v1 embeds:
 
 - `Function`, `Method`
-- `Class`, `Struct`, `Interface`, `Trait`, `Protocol`, `Enum`
+- `Class`, `Struct`, `Interface`, `Trait`, `Enum`
 - `TypeAlias`
 - `Module`
 - `Template`, `Choice` (when `tree-sitter-daml` ships)
@@ -471,7 +556,15 @@ Body content is intentionally not included — keeps the embedding focused on in
 
 ### When
 
-During indexing, after extraction and resolution. Batched at 128 texts per `fastembed-rs::embed()` call. Written via parameterized Cypher that targets the existing nodes by `qid`.
+During indexing, after extraction and resolution. Batched at 128 texts per `fastembed-rs::embed()` call. Each batch is written with one Cypher round-trip:
+
+```cypher
+UNWIND $batch AS row
+MATCH (n:Symbol {qid: row.qid})
+SET n.embedding = row.embedding
+```
+
+where `row.embedding` is a `LIST<FLOAT>` of length 384.
 
 ### Search
 
@@ -518,23 +611,28 @@ For each root in the workspace:
 
 ### Per-bucket actions
 
-**Added** — extract → write nodes/edges → queue for resolution + embedding.
+**Added** — extract → write nodes, structural edges, and `UnresolvedRef`s. (Resolution runs centrally afterwards.)
 
-**Changed** — delete the file's nodes and contents, then re-extract:
+**Changed** — delete the file's nodes and everything it contains, including its `UnresolvedRef` records. Other files' `UnresolvedRef` records (which may reference symbols in this file) are NOT touched:
 
 ```cypher
 MATCH (f:File {root_name: $root, relative_path: $rel})
-OPTIONAL MATCH (f)-[:CONTAINS*]->(child)
-DETACH DELETE f, child
+OPTIONAL MATCH (f)-[:CONTAINS*]->(child:Symbol)
+OPTIONAL MATCH (child)-[:HAS_REF]->(ref:UnresolvedRef)
+DETACH DELETE f, child, ref
 ```
 
-Then re-extract.
+The second `OPTIONAL MATCH` reaches each Symbol's own `UnresolvedRef` records (those representing references *from* this file's symbols). Cross-file references — `UnresolvedRef` nodes whose `source_qid` lives in a different file but happen to name a symbol in this file — are unaffected; the global resolution rebuild that follows will recreate cross-file edges against the new targets.
 
-**Deleted** — same `DETACH DELETE` pattern, no re-extraction.
+Then re-extract this file, producing new node `qid`s as needed.
+
+**Deleted** — same `DETACH DELETE`, no re-extraction.
 
 ### Resolution after partial changes
 
-After the changed/added set is re-extracted, run resolution **globally** — not just for affected files. A newly added function may satisfy previously-unresolved refs from elsewhere. Resolution is cheap; correctness here matters more than speed.
+After the changed/added/deleted set is processed, run the global resolution rebuild from §7 ("Resolution as idempotent rebuild"). All resolution-derived edges are dropped and recomputed from the surviving `UnresolvedRef` records against the now-current candidate set.
+
+This is the mechanism that fixes cross-file edges when a callee's `qid` changes (e.g., file B is edited): file A's `UnresolvedRef` records still describe the original source-code intent, and resolution recreates the `CALLS` edges from A to B's new symbols.
 
 ### Embedding after changes
 
@@ -548,7 +646,7 @@ One `codegraph-rs sync` iterates roots in sequence. Parallel-root sync is not v1
 ### Consistency
 
 - No transactional sync. If the process crashes mid-sync, the next run recovers via the same diff.
-- No locking against concurrent sync sessions on the same workspace — documented as "don't run two at once."
+- No locking against concurrent invocations of `codegraph-rs index` or `codegraph-rs sync` on the same workspace — running two at once will cause MERGE conflicts and corrupted intermediate state. Documented as "don't run two at once." A v2 lockfile (`<workspace>/.codegraph/.lock` via `flock`) is planned.
 
 ### Not in v1
 
@@ -567,6 +665,16 @@ One `codegraph-rs sync` iterates roots in sequence. Parallel-root sync is not v1
 - `codegraph-rs serve` launches the MCP server on stdio.
 - On startup: locate workspace config, open Neo4j connection (Bolt, auth from config), preload the `fastembed-rs` model.
 - Shutdown: close the Bolt connection cleanly on stdin EOF or SIGTERM.
+
+### Typical tool flow
+
+A Claude Code session does not know any `qid` values up front. The expected pattern is:
+
+1. `codegraph_rs_search` or `codegraph_rs_semantic_search` to find seed symbols by name or topic — these return `qid`s.
+2. `codegraph_rs_node` for full details of a specific `qid`.
+3. `codegraph_rs_callers` / `_callees` / `_impact` / `_context` / `_explore` for relationship traversal.
+
+`codegraph_rs_status` and `codegraph_rs_files` are introspection tools and do not require `qid` inputs.
 
 ### Tool surface
 
@@ -619,15 +727,16 @@ Heavy logic stays in non-MCP modules; `mcp/tools.rs` stays thin.
 ## 11. CLI surface
 
 ```
-codegraph-rs init                  scaffold .codegraph/, prompt for Neo4j details
+codegraph-rs init                  scaffold .codegraph/, prompt for Neo4j details,
+                                   create the Neo4j database (CREATE DATABASE)
 codegraph-rs index                 full build
 codegraph-rs sync                  incremental
 codegraph-rs status                stats
-codegraph-rs query <text>          codegraph_rs_search from terminal
+codegraph-rs query <text>          codegraph_rs_search from terminal (FTS / name search only)
 codegraph-rs serve                 MCP stdio server
 ```
 
-All commands accept `--workspace <path>`. No `codegraph-rs hooks install` in v1.
+All commands accept `--workspace <path>`. The CLI exposes only `query` for terminal use; richer queries (semantic, callers, callees, impact) are reachable only via the MCP interface, intentionally — that surface is designed for AI assistants, not humans. No `codegraph-rs hooks install` in v1.
 
 ## 12. Distribution
 
@@ -648,7 +757,7 @@ All commands accept `--workspace <path>`. No `codegraph-rs hooks install` in v1.
 
 ### Integration tests (real Neo4j)
 
-- Test fixture spins up a fresh dedicated database (`codegraph_test_<pid>`).
+- Test fixture spins up a fresh dedicated database (`codegraph-test-<pid>` — dashes per Neo4j 5 naming rules in §5).
 - Tests annotated `#[tokio::test]` with `#[ignore]` unless `CODEGRAPH_RS_TEST_NEO4J=1` is set.
 - Each test:
   1. Writes a small codebase into a `tempfile::tempdir()`.
@@ -678,7 +787,7 @@ Plus `cargo deny` for license/advisory checks.
 
 | Risk | Mitigation |
 |---|---|
-| `tree-sitter-haskell` parse quality on real Daml templates is poor enough to produce misleading `Function` nodes from template bodies | Accept as v1 limitation. Tag affected nodes with a `tree_sitter_reliable` property. Document the gap in README until `tree-sitter-daml` ships |
+| `tree-sitter-haskell` parse quality on real Daml templates is poor enough to produce misleading `Function` nodes from template bodies | Accept as v1 limitation. Set `parse_reliable = false` on nodes extracted from inside template/choice/signatory blocks (see §4 schema). Document the gap in README until `tree-sitter-daml` ships |
 | `fastembed-rs` model download (~130 MB) can fail on slow connections | Fail with clear retry message; document cache location; plan a `codegraph-rs prepare` command in v2 |
 | `neo4rs` driver maturity / Bolt edge cases | Pin a known-good version. Wrap behind `db/` so the driver can be swapped locally |
 | Neo4j Enterprise licensing for users distributing the tool or running in CI | v1 documents "use Neo4j Desktop (free for local dev)"; CI accepts license explicitly. Tool itself never bundles Neo4j |
@@ -722,4 +831,5 @@ Decisions made during the brainstorming phase, in chronological order:
 | 10 | MCP tool naming: `codegraph_rs_*` | Coexist with TS version's `codegraph_*` tools without collision |
 | 11 | Distribution: `cargo install` | Simplest for v1; users have Rust if they're using Rust tooling |
 | 12 | Crate layout: single crate, internal modules | Premature workspace splitting adds friction without payoff |
-| 13 | Considered Grafeo (embedded Rust graph DB) and rejected | Spike showed Cypher and persistence work, but Grafeo lacks mature visualization (a stated user driver), persistent vector index, and proper concurrent-process semantics. Pre-1.0 maturity adds risk |
+| 13 | `qid` excludes `start_line`; permanent `(:UnresolvedRef)` records as source-of-truth | Found during spec review: line-shift edits and cross-file edges would silently corrupt the graph if `qid` depended on position or if unresolved refs were transient |
+| 14 | No separate `Impl` node for Rust `impl` blocks | Methods carry the type prefix in `qualified_name`; structural simplicity over a parallel hierarchy |
