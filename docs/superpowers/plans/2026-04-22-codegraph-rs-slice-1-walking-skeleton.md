@@ -543,6 +543,8 @@ cargo test --test config_parsing 2>&1 | tail -10
 
 Expected: compile errors about `parse` and `WorkspaceConfig` being missing from `codegraph_rs::config::workspace`.
 
+> **Note on intermediate broken builds:** The project will not build between steps 4 and 6 of this task — `workspace.rs` imports `crate::config::naming` which is created in step 6. This is intentional. Don't run `cargo build` until step 7.
+
 - [ ] **Step 4: Implement the config types and parser**
 
 Create `src/config/workspace.rs`:
@@ -790,6 +792,8 @@ Expected: errors about `find_workspace_root` and `load_from_path` not being defi
 
 - [ ] **Step 3: Implement the discovery and loading helpers**
 
+> **Note:** "Append" here means *add to the file*. The new `use std::path::Path;` line should go up at the top with the other `use` statements (replacing `use std::path::PathBuf;` with `use std::path::{Path, PathBuf};`); the new functions go below the existing code.
+
 Append to `src/config/workspace.rs`:
 
 ```rust
@@ -1033,6 +1037,10 @@ git commit -m "feat(config): real Neo4j 5 db-name validation and derivation"
 
 Append to `tests/config_parsing.rs`:
 
+> **Notes for the engineer:**
+> - These tests mutate process-wide environment variables. cargo by default runs unit tests in parallel within a test binary; to avoid surprise interactions with later test additions, run unit tests with `--test-threads=1` once the suite is large enough that contention matters. For slice 1, each test uses a distinct env-var name so they don't collide.
+> - `std::env::set_var` may emit a future-incompat lint warning on Rust 1.91 (it's safe in edition 2021 but became `unsafe` in edition 2024). Ignore the warning for slice 1.
+
 ```rust
 use codegraph_rs::config::secrets::{resolve_neo4j_password, SecretsSource};
 
@@ -1040,9 +1048,6 @@ use codegraph_rs::config::secrets::{resolve_neo4j_password, SecretsSource};
 fn resolves_password_from_env() {
     // Use a dedicated env var name to avoid polluting global state
     let key = "CODEGRAPH_RS_TEST_PASSWORD_ENV";
-    // SAFETY: tests in this file run sequentially because cargo test is
-    // single-threaded per test binary by default; if you parallelize later,
-    // switch to a thread-local override.
     std::env::set_var(key, "from-env");
 
     let dir = tempdir().unwrap();
@@ -1236,8 +1241,12 @@ impl Connection {
     pub async fn ping(&self) -> Result<()> {
         let mut stream = self.graph.execute(neo4rs::query("RETURN 1 AS x")).await
             .context("ping query failed")?;
-        let row = stream.next().await.context("ping returned no row")?
-            .context("ping row error")?;
+        // First `.context` attaches to a Result<_, neo4rs::Error> (DB-level error).
+        // Second `.context` attaches to Option::None (empty stream — anyhow's
+        // `Context for Option` converts None into an error with this message).
+        let row = stream.next().await
+            .context("ping query stream errored")?
+            .context("ping returned no row (empty stream)")?;
         let x: i64 = row.get("x").context("ping row missing `x`")?;
         anyhow::ensure!(x == 1, "ping returned unexpected value: {x}");
         Ok(())
@@ -1851,9 +1860,12 @@ pub fn run(workspace_arg: Option<&Path>) -> Result<()> {
 async fn single_count(conn: &Connection, cypher: &str) -> Result<i64> {
     let mut stream = conn.graph.execute(query(cypher)).await
         .with_context(|| format!("running `{cypher}`"))?;
+    // First context: DB-level error from the row stream.
+    // Second context: stream finished without producing a row (Option::None case
+    // — anyhow's Context impl for Option turns None into this error).
     let row = stream.next().await
-        .with_context(|| format!("no row from `{cypher}`"))?
-        .with_context(|| format!("row error from `{cypher}`"))?;
+        .with_context(|| format!("stream error reading result of `{cypher}`"))?
+        .with_context(|| format!("`{cypher}` returned no row"))?;
     row.get("c").context("row missing `c`")
 }
 
@@ -1861,8 +1873,13 @@ async fn max_last_indexed(conn: &Connection) -> Result<Option<i64>> {
     let mut stream = conn.graph
         .execute(query("MATCH (n:File) RETURN max(n.last_indexed_at) AS t"))
         .await?;
-    let row = stream.next().await.context("no row")??;
-    Ok(row.get::<Option<i64>>("t").context("missing `t`")?)
+
+    // Handle both possibilities: stream may produce zero rows (no Files yet)
+    // or one row whose `t` is NULL (which deserializes to None).
+    match stream.next().await? {
+        None => Ok(None),
+        Some(row) => row.get::<Option<i64>>("t").context("missing `t`"),
+    }
 }
 ```
 
