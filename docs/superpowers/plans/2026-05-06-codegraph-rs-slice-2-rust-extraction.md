@@ -101,7 +101,7 @@ codegraph-rs/
 
 - [ ] **Step 1: Add extraction deps to Cargo.toml**
 
-In `/Users/gyorgybalazsi/codegraph-rs/Cargo.toml`, add to `[dependencies]`:
+In `/Users/gyorgybalazsi/codegraph-rs/Cargo.toml`, add the new deps AND **enable the `json` feature on the existing `neo4rs` line** (Task 10's writer feeds `serde_json::Value` into `Query::param`, which only converts via `BoltType: From<serde_json::Value>` when the `json` feature is on).
 
 ```toml
 tree-sitter = "0.25"
@@ -109,9 +109,12 @@ tree-sitter-rust = "0.24"
 ignore = "0.4"
 blake3 = "1"
 rayon = "1"
+serde_json = "1"
 ```
 
-Place these alphabetically among the existing deps. Result section should look like:
+And replace `neo4rs = "0.8"` with `neo4rs = { version = "0.8", features = ["json"] }`.
+
+Result section should look like:
 
 ```toml
 [dependencies]
@@ -119,9 +122,10 @@ anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 ignore = "0.4"
-neo4rs = "0.8"
+neo4rs = { version = "0.8", features = ["json"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "io-std", "fs", "process", "signal"] }
 toml = "1"
@@ -132,6 +136,8 @@ tree-sitter-rust = "0.24"
 ```
 
 (Order may differ from the existing file — match the existing alphabetical convention.)
+
+> Note: `serde_json` is moved here from Task 10 to consolidate all the slice-2 dep additions in one commit.
 
 - [ ] **Step 2: Update src/lib.rs**
 
@@ -310,6 +316,8 @@ fn raw_node_is_constructible() {
         signature: Some("fn foo()".to_string()),
         doc: None,
         parse_reliable: true,
+        content_hash: None,
+        last_indexed_at: None,
     };
     assert_eq!(n.name, "foo");
     assert_eq!(n.kind, NodeKind::Function);
@@ -452,6 +460,10 @@ pub struct RawNode {
     /// True for tree-sitter parses we trust; false for Daml template bodies
     /// extracted via tree-sitter-haskell (Slice 7+). For Rust always true.
     pub parse_reliable: bool,
+    /// File-only properties (per spec §4 "File-specific properties").
+    /// `None` for non-File nodes; `Some(...)` for File.
+    pub content_hash: Option<String>,
+    pub last_indexed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -899,6 +911,21 @@ fn extraction_emits_file_node() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].name, "f.rs");
     assert_eq!(files[0].relative_path, "f.rs");
+    // File node carries content_hash + last_indexed_at; non-File nodes leave these as None.
+    assert!(files[0].content_hash.is_some(), "File should have content_hash");
+    let hash = files[0].content_hash.as_ref().unwrap();
+    assert_eq!(hash.len(), 64, "BLAKE3 hex hash is 64 chars");
+    assert!(files[0].last_indexed_at.is_some(), "File should have last_indexed_at");
+}
+
+#[test]
+fn non_file_nodes_have_no_content_hash() {
+    let source = "fn x() {}";
+    let result = extract_rust(source, "r", "f.rs").expect("ok");
+    let funcs: Vec<_> = result.nodes.iter().filter(|n| n.kind == NodeKind::Function).collect();
+    assert_eq!(funcs.len(), 1);
+    assert!(funcs[0].content_hash.is_none(), "non-File nodes must leave content_hash unset");
+    assert!(funcs[0].last_indexed_at.is_none());
 }
 
 #[test]
@@ -946,6 +973,7 @@ Overwrite `src/extraction/languages/rust.rs`:
 use anyhow::{Context, Result};
 use tree_sitter::{Query, QueryCursor, StreamingIterator};
 
+use crate::extraction::hash::source_hash;
 use crate::extraction::parser::parse_rust;
 use crate::extraction::result::{
     EdgeKind, ExtractionResult, NodeKind, RawEdge, RawNode,
@@ -1009,6 +1037,8 @@ pub fn extract_rust(source: &str, root_name: &str, relative_path: &str) -> Resul
                 signature: Some(signature),
                 doc: None,
                 parse_reliable: true,
+                content_hash: None,
+                last_indexed_at: None,
             });
             result.edges.push(RawEdge {
                 from_qid: file_qid.clone(),
@@ -1028,6 +1058,10 @@ fn build_file_node(source: &str, root_name: &str, relative_path: &str) -> RawNod
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| relative_path.to_string());
     let line_count = source.lines().count() as u32;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     RawNode {
         qid,
         kind: NodeKind::File,
@@ -1043,6 +1077,8 @@ fn build_file_node(source: &str, root_name: &str, relative_path: &str) -> RawNod
         signature: None,
         doc: None,
         parse_reliable: true,
+        content_hash: Some(source_hash(source)),
+        last_indexed_at: Some(now_unix),
     }
 }
 
@@ -1085,13 +1121,13 @@ fn signature_text(source: &str, node: tree_sitter::Node) -> String {
 cargo test --test extraction_unit 2>&1 | tail -10
 ```
 
-Expected: 18 tests pass (14 + 4 new).
+Expected: 20 tests pass (14 + 6 new — 4 function-extraction tests + 2 file-properties tests).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/extraction/languages/rust.rs src/extraction/languages/rust.scm tests/extraction_unit.rs
-git commit -m "feat(extraction): Rust extractor — function_item -> Function with CONTAINS"
+git commit -m "feat(extraction): Rust extractor — function_item -> Function with CONTAINS, file content hash"
 ```
 
 ---
@@ -1246,6 +1282,8 @@ In `src/extraction/languages/rust.rs`, refactor `extract_rust` to handle multipl
                     signature,
                     doc: None,
                     parse_reliable: true,
+                    content_hash: None,
+                    last_indexed_at: None,
                 });
                 result.edges.push(RawEdge {
                     from_qid: file_qid.clone(),
@@ -1266,7 +1304,7 @@ Remove the now-stale `function_ordinals` variable, `function_def_idx`, and `func
 cargo test --test extraction_unit 2>&1 | tail -10
 ```
 
-Expected: 23 tests pass.
+Expected: 25 tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -1321,6 +1359,15 @@ Append to `src/extraction/languages/rust.scm`:
 
 (`(_)` matches any kind of argument node — `scoped_identifier`, `use_list`, `use_as_clause`, etc.)
 
+> **Verify the `argument:` field name.** If `Query::new` succeeds but the test produces 0 imports, the field name in tree-sitter-rust 0.24 may be different (some grammar versions use unnamed children). To diagnose:
+>
+> ```bash
+> # From the codegraph-rs root, with cargo workspace target:
+> rg --files ~/.cargo/registry/src | grep tree-sitter-rust | grep node-types
+> ```
+>
+> Open `node-types.json` and search for `"type": "use_declaration"` — its `fields` array tells you the real field name. If absent, replace the query with a positional pattern: `(use_declaration (_) @import.path) @import.def` (no field). Re-run the test.
+
 - [ ] **Step 3: Update the captures table**
 
 In `src/extraction/languages/rust.rs`, add to the `captures` slice:
@@ -1337,7 +1384,7 @@ Then handle the case that Import has a path-text-as-name rather than an identifi
 cargo test --test extraction_unit 2>&1 | tail -10
 ```
 
-Expected: 25 tests pass.
+Expected: 27 tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -1411,6 +1458,8 @@ Append to `src/extraction/languages/rust.scm`:
 (call_expression
   function: (_) @call.callee) @call.site
 ```
+
+> **Verify the `function:` field name.** Same diagnostic as Task 8: if the test produces 0 unresolved refs after a clean compile, inspect tree-sitter-rust 0.24's `node-types.json` for `call_expression`'s field names. The field name should be `function` per the standard tree-sitter-rust grammar — but verify before assuming. If different, adjust the query.
 
 - [ ] **Step 3: Implement call extraction**
 
@@ -1498,7 +1547,7 @@ fn enclosing_symbol_qid(nodes: &[RawNode], line: u32, col: u32) -> Option<&Strin
 cargo test --test extraction_unit 2>&1 | tail -10
 ```
 
-Expected: 28 tests pass.
+Expected: 30 tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -1570,6 +1619,8 @@ pub async fn write_extraction(conn: &Connection, results: Vec<ExtractionResult>)
 
 async fn write_nodes(conn: &Connection, kind: NodeKind, nodes: &[RawNode]) -> Result<()> {
     let label = kind.as_label();
+    // content_hash and last_indexed_at are set on File nodes only; on other
+    // nodes the row values are null and Neo4j removes the property.
     let cypher_text = format!(
         "UNWIND $batch AS row \
          MERGE (n:Symbol:{label} {{qid: row.qid}}) \
@@ -1584,7 +1635,9 @@ async fn write_nodes(conn: &Connection, kind: NodeKind, nodes: &[RawNode]) -> Re
              n.end_col = row.end_col, \
              n.signature = row.signature, \
              n.doc = row.doc, \
-             n.parse_reliable = row.parse_reliable"
+             n.parse_reliable = row.parse_reliable, \
+             n.content_hash = row.content_hash, \
+             n.last_indexed_at = row.last_indexed_at"
     );
 
     for chunk in nodes.chunks(BATCH_SIZE) {
@@ -1659,6 +1712,11 @@ fn node_to_json(n: &RawNode) -> Value {
     m.insert("signature".into(), n.signature.clone().map(Value::String).unwrap_or(Value::Null));
     m.insert("doc".into(), n.doc.clone().map(Value::String).unwrap_or(Value::Null));
     m.insert("parse_reliable".into(), n.parse_reliable.into());
+    m.insert("content_hash".into(), n.content_hash.clone().map(Value::String).unwrap_or(Value::Null));
+    m.insert("last_indexed_at".into(), match n.last_indexed_at {
+        Some(t) => Value::Number(t.into()),
+        None => Value::Null,
+    });
     Value::Object(m)
 }
 
@@ -1683,27 +1741,17 @@ fn edge_to_json(e: &RawEdge) -> Value {
 
 > **Note on `UnresolvedKind`:** `UnresolvedKind` was used here in the import line (`use crate::extraction::result::{... UnresolvedKind ...}`). The `as_str()` method called on `r.kind` is what the writer needs. If your `result.rs` from Task 2 doesn't have `UnresolvedKind::as_str()`, add it. The Task 2 spec includes it; verify before continuing.
 
-- [ ] **Step 2: Add serde_json dependency**
+> **Note on `Query::param`:** The `serde_json::Value` arguments require neo4rs's `json` feature flag, which Task 1 already enabled. If you skipped that, you'll see compile errors here — go back and update `Cargo.toml`.
 
-`serde_json` isn't in slice 1's Cargo.toml. Add it now since `neo4rs` 0.8 takes parameters as `serde_json::Value` (or via `BoltType`; use serde_json for ergonomics).
-
-In `/Users/gyorgybalazsi/codegraph-rs/Cargo.toml`, add to `[dependencies]`:
-
-```toml
-serde_json = "1"
-```
-
-> Implementer note: if `neo4rs::query(...).param(...)` does NOT accept `serde_json::Value` directly, switch to `neo4rs::BoltType` construction. The neo4rs 0.8 README shows `query(...).param("k", value)` where `value: impl Into<BoltType>`. `BoltType: From<serde_json::Value>` exists; if not, adapt with `BoltType::Map`/`BoltType::List`/etc. by hand. Validate via the Task 12 integration test.
-
-- [ ] **Step 3: Build and verify**
+- [ ] **Step 2: Build and verify**
 
 ```bash
 cargo build 2>&1 | tail -5
 ```
 
-Expected: clean. If neo4rs's `param` doesn't accept `serde_json::Value` directly, you'll see compile errors — adjust per the note above.
+Expected: clean.
 
-- [ ] **Step 4: Run all tests (no integration_index yet — added in Task 12)**
+- [ ] **Step 3: Run all tests (no integration_index yet — added in Task 12)**
 
 ```bash
 cargo test 2>&1 | tail -10
@@ -1711,10 +1759,10 @@ cargo test 2>&1 | tail -10
 
 Expected: existing tests still pass; no new tests added in this task.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/db/write.rs Cargo.toml Cargo.lock
+git add src/db/write.rs
 git commit -m "feat(db): write_extraction — batched UNWIND/MERGE for nodes, edges, refs"
 ```
 
@@ -1863,10 +1911,18 @@ cargo test 2>&1 | tail -10
 
 Expected: build clean. The `cli_smoke` test for `index` previously expected "not yet implemented" — but `index` now runs the real command (which will fail without a workspace, with a different error). Update the test if needed.
 
-In `tests/cli_smoke.rs`, the test `slice1_stub_commands_fail_with_not_implemented` iterates over `["index", "sync", "serve"]`. Remove `"index"` from that list (since it's now implemented and will produce a different error message):
+In `tests/cli_smoke.rs`, the test `slice1_stub_commands_fail_with_not_implemented` iterates over `["index", "sync", "serve"]`. Two changes:
+
+1. **Rename** the test (the `slice1_` prefix is now misleading) to `stub_commands_fail_with_not_implemented`.
+2. **Remove `"index"`** from the iteration list (it's now a real command and will produce a different error message):
 
 ```rust
+#[test]
+fn stub_commands_fail_with_not_implemented() {
     for sub in &["sync", "serve"] {
+        // ... existing body unchanged ...
+    }
+}
 ```
 
 - [ ] **Step 5: Commit**
@@ -2076,7 +2132,20 @@ git commit -m "test(extraction): integration test indexing tiny-rust fixture aga
 git tag slice-2-rust-extraction
 ```
 
-Expected: all tests pass (28 unit + 4 integration_db SKIPs + 1 integration_init SKIP + 1 integration_status SKIP + 1 integration_index SKIP + 2 cli_smoke = ~37 tests). All clippy/fmt clean. Tag at HEAD.
+Expected: all tests pass. Approximate breakdown:
+
+| Test binary | Count |
+|---|---|
+| `extraction_unit` (slice 2 new) | 30 |
+| `config_parsing` (slice 1 carry) | 13 |
+| `cli_smoke` (slice 1 carry) | 2 |
+| `integration_db` (slice 1 carry, SKIP path) | 2 |
+| `integration_init` (slice 1 carry, SKIP path) | 1 |
+| `integration_status` (slice 1 carry, SKIP path) | 1 |
+| `integration_index` (slice 2 new, SKIP path) | 1 |
+| **Total** | **50** |
+
+All clippy/fmt clean. Tag at HEAD.
 
 ---
 
