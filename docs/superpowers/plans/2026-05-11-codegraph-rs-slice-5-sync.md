@@ -46,8 +46,9 @@ The resolve step at the end is what makes cross-file edges self-heal: even if a 
 - Git hook auto-sync — not v1
 - Tree-sitter incremental reparse (`edit()` API) — v1 reparses whole-file
 - Parallel-root sync — v1 iterates roots sequentially
-- Locking against concurrent sync sessions — documented as "don't run two at once" (same caveat as `index`)
-- Embeddings (Slice 4) — sync re-embedding will be added when Slice 4 lands
+- Embeddings — sync re-embedding will be added when the embeddings slice lands
+- **Scoped re-resolution.** `resolve()` rebuilds confidence-bearing edges for the entire workspace on every sync, even if only one file changed. Spec §7 acknowledges this as a known v1 cost: "for an UnresolvedRef count R, complexity is roughly O(R × log N); expect <2s for a 50k-symbol workspace." A future slice can scope re-resolution to refs whose source file or candidate set changed. For now: sync cost scales with workspace size, not change size.
+- **Concurrent sync invocations.** Per spec §9: "running two at once will cause MERGE conflicts and corrupted intermediate state. Documented as 'don't run two at once.'" The CLI does NOT take a file lock. Same caveat as `codegraph-rs index`. A v2 lockfile at `<workspace>/.codegraph/.lock` is planned.
 
 ---
 
@@ -518,20 +519,47 @@ pub async fn run(conn: &Connection, cfg: &WorkspaceConfig) -> Result<SyncStats> 
     for root in &cfg.workspace.roots {
         info!("syncing root `{}`", root.name);
 
-        // Filesystem state: walk + hash.
-        let fs_state: HashMap<String, String> = walk_root(&root.path, &root.name, languages)
-            .map(|f| {
-                let source = std::fs::read_to_string(&f.absolute_path)
-                    .with_context(|| format!("reading {}", f.absolute_path.display()))?;
-                Ok((f.relative_path.clone(), source_hash(&source)))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
+        // Filesystem state: walk + hash + stash source (so we don't re-read
+        // changed/added files later during extraction).
+        // Unreadable files are warn-and-skipped, matching slice 2's
+        // orchestrator behavior. A skipped file is treated as "unchanged":
+        // omitting it from the hash map means it won't appear in the
+        // Added/Changed buckets, AND if it's already in the DB, it also
+        // won't appear in Deleted because we'll see it in the walker
+        // (just couldn't read it). To make sure a transiently unreadable
+        // file isn't bucketed as Deleted, we still record its presence with
+        // a placeholder by re-using the DB's hash if available.
+        let mut fs_hashes: HashMap<String, String> = HashMap::new();
+        let mut fs_sources: HashMap<String, String> = HashMap::new();
+        let mut unreadable: Vec<String> = Vec::new();
+        for f in walk_root(&root.path, &root.name, languages) {
+            match std::fs::read_to_string(&f.absolute_path) {
+                Ok(source) => {
+                    fs_hashes.insert(f.relative_path.clone(), source_hash(&source));
+                    fs_sources.insert(f.relative_path, source);
+                }
+                Err(e) => {
+                    warn!("read failed for {}: {e:#} — treating as unchanged", f.absolute_path.display());
+                    unreadable.push(f.relative_path);
+                }
+            }
+        }
 
         // DB state for this root.
         let db_state = list_files_in_root(conn, &root.name).await
             .with_context(|| format!("list_files_in_root({})", root.name))?;
 
-        let diff: FileDiff = diff_files(&fs_state, &db_state);
+        // For unreadable files that are already in the DB, preserve their
+        // DB hash in fs_hashes so the diff treats them as unchanged (not
+        // Deleted). This prevents transient I/O failures from triggering
+        // destructive sync actions.
+        for rel in &unreadable {
+            if let Some(db_hash) = db_state.get(rel) {
+                fs_hashes.insert(rel.clone(), db_hash.clone());
+            }
+        }
+
+        let diff: FileDiff = diff_files(&fs_hashes, &db_state);
         info!(
             "root `{}`: added={}, changed={}, deleted={}",
             root.name,
@@ -546,20 +574,22 @@ pub async fn run(conn: &Connection, cfg: &WorkspaceConfig) -> Result<SyncStats> 
                 .with_context(|| format!("delete_file_subtree({}, {})", root.name, rel))?;
         }
 
-        // Re-extract added + changed files.
+        // Re-extract added + changed files using the stashed source (no
+        // second filesystem read).
         for rel in diff.added.iter().chain(diff.changed.iter()) {
-            let abs = root.path.join(rel);
-            let source = match std::fs::read_to_string(&abs) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("read failed for {}: {e:#}", abs.display());
-                    continue;
-                }
+            let Some(source) = fs_sources.get(rel) else {
+                // Should never happen since added/changed files came from
+                // fs_hashes which was populated alongside fs_sources, but
+                // be defensive.
+                warn!("missing stashed source for {rel}, skipping");
+                continue;
             };
-            // Slice 5 only supports Rust here. Slice 7 adds Daml dispatch.
-            // Source-extension routing matches the walker's `language` field.
+            let abs = root.path.join(rel);
+            // Slice 5 only supports Rust here. The Daml slice will add
+            // Daml dispatch. Source-extension routing matches the walker's
+            // `language` field.
             let result = match abs.extension().and_then(|s| s.to_str()) {
-                Some("rs") => extract_rust(&source, &root.name, rel),
+                Some("rs") => extract_rust(source, &root.name, rel),
                 Some(other) => {
                     warn!("no extractor for `.{other}`, skipping {}", rel);
                     continue;
@@ -602,7 +632,7 @@ pub async fn run(conn: &Connection, cfg: &WorkspaceConfig) -> Result<SyncStats> 
 }
 ```
 
-> Note on the language dispatch — sync's per-file extraction has a small switch that mirrors the orchestrator's. Slice 7 (Daml) will need to update both call sites. Cleaner refactor: extract a `dispatch_by_language(lang, &source, root_name, relative_path) -> Result<ExtractionResult>` helper and call it from both places. Defer to slice 7 unless trivial to do now.
+> Note on the language dispatch — sync's per-file extraction has a small switch that mirrors the orchestrator's. The Daml slice will need to update both call sites. Cleaner refactor: extract a `dispatch_by_language(lang, &source, root_name, relative_path) -> Result<ExtractionResult>` helper and call it from both places. Defer to the Daml slice unless trivial to do now.
 
 - [ ] **Step 2: Build, clippy, fmt, test**
 
@@ -1012,7 +1042,7 @@ Verify the artifact:
 - [ ] `CODEGRAPH_RS_TEST_NEO4J=1 cargo test -- --test-threads=1` — all 61 pass
 - [ ] Manual: `codegraph-rs sync` runs against an already-initialized workspace; idempotent (running twice on unchanged workspace produces 0 added/changed/deleted)
 - [ ] Modifying a file and re-running `sync` updates only that file's subgraph; resolution edges re-emerge
-- [ ] No embeddings yet (Slice 4 deferred)
-- [ ] No MCP server yet (Slice 6)
+- [ ] No embeddings yet (deferred — embeddings slice produces vector data; MCP slice exposes search)
+- [ ] No MCP server yet
 
-When all check, slice 5 is complete and we can write the next slice. Likely Slice 4 (vector embeddings) next, then Slice 6 (MCP) so the embeddings get a consumer.
+When all check, slice 5 is complete and we can write the next slice. Likely the embeddings slice next, then the MCP slice so the embeddings get a consumer.
