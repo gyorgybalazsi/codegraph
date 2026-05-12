@@ -1239,8 +1239,14 @@ fn enabled() -> bool {
     std::env::var("CODEGRAPH_RS_TEST_NEO4J").as_deref() == Ok("1")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_exposes_graph_tools_against_tiny_rust() {
+// Plain `#[test]` (not `#[tokio::test]`) — `init::run` and `index::run` each
+// build their own internal `tokio::runtime::Runtime` and call `block_on`,
+// which panics ("Cannot start a runtime from within a runtime") if invoked
+// from inside an outer Tokio context. All other Slice 2/3/5 integration
+// tests follow the same pattern: synchronous body for the CLI calls, then
+// a dedicated `Runtime` for ad-hoc async work.
+#[test]
+fn mcp_exposes_graph_tools_against_tiny_rust() {
     if !enabled() {
         eprintln!("SKIP: set CODEGRAPH_RS_TEST_NEO4J=1 to enable");
         return;
@@ -1268,40 +1274,44 @@ async fn mcp_exposes_graph_tools_against_tiny_rust() {
     index::run(Some(dir.path())).expect("index must succeed");
 
     let cfg = load_from_path(dir.path()).unwrap();
-    let conn = Connection::open(
-        &cfg.workspace.neo4j.uri,
-        &cfg.workspace.neo4j.username,
-        &pw,
-        &cfg.workspace.neo4j.database,
-    ).await.unwrap();
-
-    // Capture the db name before moving cfg into the server.
     let db_name = cfg.workspace.neo4j.database.clone();
 
-    let server = McpServer::new(conn, cfg, dir.path().to_path_buf());
+    // All async work — MCP server + client + cleanup — happens inside one
+    // dedicated runtime. `Runtime::new()` is safe here because we are NOT
+    // inside another Tokio context (this is a plain `#[test]`).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let conn = Connection::open(
+            &cfg.workspace.neo4j.uri,
+            &cfg.workspace.neo4j.username,
+            &pw,
+            &cfg.workspace.neo4j.database,
+        ).await.unwrap();
 
-    // Build paired duplex pipes: server side ↔ client side.
-    // Each DuplexStream is AsyncRead + AsyncWrite; rmcp's `IntoTransport for (R, W)`
-    // requires a tuple, so split each half into its read/write components.
-    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-    let (server_rx, server_tx) = tokio::io::split(server_io);
-    let (client_rx, client_tx) = tokio::io::split(client_io);
+        let server = McpServer::new(conn, cfg, dir.path().to_path_buf());
 
-    let server_running = server
-        .serve((server_rx, server_tx))
-        .await
-        .expect("server serve");
+        // Build paired duplex pipes: server side ↔ client side.
+        // Each DuplexStream is AsyncRead + AsyncWrite; rmcp's `IntoTransport for (R, W)`
+        // requires a tuple, so split each half into its read/write components.
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let (server_rx, server_tx) = tokio::io::split(server_io);
+        let (client_rx, client_tx) = tokio::io::split(client_io);
 
-    // Client side speaks MCP over the other half.
-    let client_info = ClientInfo {
-        protocol_version: ProtocolVersion::default(),
-        capabilities: Default::default(),
-        client_info: Implementation { name: "test".into(), version: "0".into() },
-    };
-    let client = client_info
-        .serve((client_rx, client_tx))
-        .await
-        .expect("client init");
+        let server_running = server
+            .serve((server_rx, server_tx))
+            .await
+            .expect("server serve");
+
+        // Client side speaks MCP over the other half.
+        let client_info = ClientInfo {
+            protocol_version: ProtocolVersion::default(),
+            capabilities: Default::default(),
+            client_info: Implementation { name: "test".into(), version: "0".into() },
+        };
+        let client = client_info
+            .serve((client_rx, client_tx))
+            .await
+            .expect("client init");
 
     // list_tools should return all 7.
     let tools = client.list_tools(Default::default()).await.expect("list_tools").tools;
@@ -1363,14 +1373,21 @@ async fn mcp_exposes_graph_tools_against_tiny_rust() {
     assert_eq!(nbody["node"]["name"], json!("library_entry"));
     assert!(nbody["source"].as_str().unwrap().contains("library_entry"));
 
-    // node with bogus qid — should come back as a tool-level error (CallToolResult
-    // with `is_error: Some(true)`), not silently succeed with empty content.
-    let bogus = client.call_tool(CallToolRequestParam {
+    // node with bogus qid — should surface as an error, not silently succeed
+    // with empty content. rmcp 1.5 may route a `Err(ErrorData)` from a tool
+    // handler either as a tool-level error (Ok with `is_error: Some(true)`)
+    // or as a JSON-RPC error (`Err` from `call_tool`). Both are acceptable;
+    // the test must FAIL only if the call returned a successful result.
+    match client.call_tool(CallToolRequestParam {
         name: "codegraph_rs_node".into(),
         arguments: Some(json!({ "qid": "definitely-not-a-real-qid" }).as_object().unwrap().clone()),
-    }).await.expect("bogus-node call returns Ok with is_error=true");
-    assert_eq!(bogus.is_error, Some(true),
-               "unknown qid should mark CallToolResult.is_error=true; got {:?}", bogus);
+    }).await {
+        Ok(r) => assert_eq!(
+            r.is_error, Some(true),
+            "unknown qid should mark CallToolResult.is_error=true; got {r:?}"
+        ),
+        Err(_) => { /* RPC-level error is also acceptable */ }
+    }
 
     // callees: library_entry → helper
     let callees = client.call_tool(CallToolRequestParam {
@@ -1427,16 +1444,17 @@ async fn mcp_exposes_graph_tools_against_tiny_rust() {
         assert_eq!(f["root_name"], json!("tiny"), "every entry should be `tiny`-rooted");
     }
 
-    // Clean shutdown
-    drop(client);
-    drop(server_running);
+        // Clean shutdown
+        drop(client);
+        drop(server_running);
+
+        // Cleanup database (db_name was captured before moving cfg into the server).
+        let sys = Connection::system("bolt://localhost:7687", "neo4j", &pw).await.unwrap();
+        sys.graph.execute(query(&format!("DROP DATABASE `{db_name}` IF EXISTS WAIT")))
+            .await.unwrap().next().await.ok();
+    });
 
     std::env::remove_var("CODEGRAPH_RS_NEO4J_PASSWORD");
-
-    // Cleanup database (db_name was captured before moving cfg into the server)
-    let sys = Connection::system("bolt://localhost:7687", "neo4j", &pw).await.unwrap();
-    sys.graph.execute(query(&format!("DROP DATABASE `{db_name}` IF EXISTS WAIT")))
-        .await.unwrap().next().await.ok();
 }
 
 fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
