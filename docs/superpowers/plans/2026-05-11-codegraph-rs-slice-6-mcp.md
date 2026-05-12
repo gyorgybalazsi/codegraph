@@ -1332,6 +1332,21 @@ async fn mcp_exposes_graph_tools_against_tiny_rust() {
     let arr = results.as_array().expect("results array");
     assert!(arr.iter().any(|r| r["name"] == "library_entry"), "library_entry should match search");
 
+    // search with `kinds: ["Function"]` filter — exercises the kinds-filter branch.
+    // tiny-rust has File, Module, Function, Struct, Enum nodes; with kinds=[Function]
+    // we should only see Function-labeled hits.
+    let search_funcs = client.call_tool(CallToolRequestParam {
+        name: "codegraph_rs_search".into(),
+        arguments: Some(json!({ "query": "library_entry", "kinds": ["Function"] }).as_object().unwrap().clone()),
+    }).await.expect("search-funcs call");
+    let fres = &search_funcs.structured_content.expect("search-funcs structured")["results"];
+    let farr = fres.as_array().expect("results array");
+    assert!(!farr.is_empty(), "expected at least one Function hit for `library_entry`");
+    for hit in farr {
+        assert_eq!(hit["kind"], json!("Function"),
+                   "kinds filter should restrict to Function, got {hit}");
+    }
+
     // Pick a qid for downstream tests.
     let library_qid = arr.iter()
         .find(|r| r["name"] == "library_entry")
@@ -1347,6 +1362,15 @@ async fn mcp_exposes_graph_tools_against_tiny_rust() {
     let nbody = node.structured_content.expect("node structured");
     assert_eq!(nbody["node"]["name"], json!("library_entry"));
     assert!(nbody["source"].as_str().unwrap().contains("library_entry"));
+
+    // node with bogus qid — should come back as a tool-level error (CallToolResult
+    // with `is_error: Some(true)`), not silently succeed with empty content.
+    let bogus = client.call_tool(CallToolRequestParam {
+        name: "codegraph_rs_node".into(),
+        arguments: Some(json!({ "qid": "definitely-not-a-real-qid" }).as_object().unwrap().clone()),
+    }).await.expect("bogus-node call returns Ok with is_error=true");
+    assert_eq!(bogus.is_error, Some(true),
+               "unknown qid should mark CallToolResult.is_error=true; got {:?}", bogus);
 
     // callees: library_entry → helper
     let callees = client.call_tool(CallToolRequestParam {
@@ -1390,6 +1414,18 @@ async fn mcp_exposes_graph_tools_against_tiny_rust() {
     let fbody = files.structured_content.expect("files structured");
     let files_arr = fbody["files"].as_array().unwrap();
     assert_eq!(files_arr.len(), 3);
+
+    // files with `root: "tiny"` filter — exercises the root-filter branch.
+    let files_tiny = client.call_tool(CallToolRequestParam {
+        name: "codegraph_rs_files".into(),
+        arguments: Some(json!({ "root": "tiny" }).as_object().unwrap().clone()),
+    }).await.expect("files-tiny call");
+    let ftbody = files_tiny.structured_content.expect("files-tiny structured");
+    let ftarr = ftbody["files"].as_array().unwrap();
+    assert_eq!(ftarr.len(), 3, "tiny root should also list all 3 files");
+    for f in ftarr {
+        assert_eq!(f["root_name"], json!("tiny"), "every entry should be `tiny`-rooted");
+    }
 
     // Clean shutdown
     drop(client);
