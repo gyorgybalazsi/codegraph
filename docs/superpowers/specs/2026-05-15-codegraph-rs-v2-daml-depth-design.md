@@ -24,7 +24,7 @@ v1 emits Templates and Choices but they are regex-anchored opaque blobs with lin
 | Slice | Scope | Tag |
 |---|---|---|
 | **10a — Daml structure + fields** | Replace regex `pass_d_templates_and_choices` with tree-sitter queries that filter `(variable)` nodes by Daml keyword. Add NodeKinds: `Interface`, `Viewtype`, `Exception`, `Field`. Fields are CONTAINS-children of their parent Template / Choice / Interface. | `slice-10a-daml-structure` |
-| **10b — Daml authorization edges** | Extract `signatory` / `controller` / `observer` party expressions; resolve to Field Symbols (or free Symbols if literal Party). Extract `implements` / `requires` relationships between Templates and Interfaces. Add 5 new EdgeKinds + 5 new UnresolvedKinds. | `slice-10b-daml-edges` |
+| **10b — Daml authorization edges** | Extract `signatory` / `controller` / `observer` party expressions; resolve identifier-shaped operands to Field Symbols (preferred) or workspace-scoped Symbols (fallback). Decompose multi-party expressions (lists, set-builders) into one ref per identifier — see §3.3. Extract `implements` / `requires` relationships between Templates and Interfaces. Add 5 new EdgeKinds + 5 new UnresolvedKinds. | `slice-10b-daml-edges` |
 
 Each slice is independently shippable, ~7-9 tasks, passing its own integration test gate. v1's pain point ("templates are regex-only opaque blobs") is gone after 10a alone.
 
@@ -45,9 +45,11 @@ Each slice is independently shippable, ~7-9 tasks, passing its own integration t
 | `Interface` | `interface I where ...` | `Module.I` | false (keyword anchor) | yes (add to `EMBED_KINDS_CYPHER_LIST`) |
 | `Viewtype` | `viewtype V` inside an interface body | `Module.I.V` | false (keyword anchor) | yes |
 | `Exception` | `exception E with ... where message ...` | `Module.E` | false (keyword anchor) | yes |
-| `Field` | `with`-block typed bindings inside a Template / Choice / Interface (e.g., `owner : Party`) | `Module.Template.field_name` | true (haskell parses `name : type` as a signature) | no (fields are not embed-eligible per spec §8 — they're leaf state) |
+| `Field` | `with`-block typed bindings inside a Template / Choice / Interface (e.g., `owner : Party`) | Template field: `Module.Template.field_name`. Choice field: `Module.Template.Choice.field_name`. Interface field: `Module.Interface.field_name`. The qualified-name carries the full container chain so a Field is unambiguously addressable across the workspace. | true (haskell parses `name : type` as a signature) | no (fields are not embed-eligible per spec §8 — they're leaf state) |
 
 Templates and Choices remain `parse_reliable: false`. The *keyword anchors* are still detected by text-matching against haskell's `(variable)` nodes; only the surrounding structure (constructor names, with-block field signatures) is grammar-clean. Everything *inside* a template body — signatory expressions, choice signatures, field types — gets `parse_reliable: true`.
+
+**Why `Viewtype` is a NodeKind rather than an edge.** `viewtype V` inside an interface body names an existing `data V = ...` Struct. A cleaner model would be an edge `Interface -[VIEWTYPE]→ Struct(V)`, with the Struct already existing from `data` extraction. We choose the NodeKind model anyway because: (a) it makes Viewtype embed-eligible without bridging through another node, which matters for semantic search queries like *"what's the view of this contract?"*; (b) it keeps slice 10a's surface symmetric — every Daml keyword-anchored construct becomes a NodeKind. The alternative (Viewtype as `EdgeKind::Viewtype` introduced in slice 10b) is a viable v3 refactor if Viewtype-as-Symbol turns out to be redundant in practice.
 
 Slice 7's `EMBED_KINDS_CYPHER_LIST` constants in `src/graph/status.rs` and `src/vectors/query.rs` each gain three entries: `'Interface', 'Viewtype', 'Exception'`. The embedding pipeline picks them up automatically — no orchestrator changes needed.
 
@@ -67,9 +69,9 @@ Extraction emits `UnresolvedRef { kind: Signatory | Controller | Observer | Impl
 
 ### 2.4 No data migration
 
-All additions are pure label / property additions; no constraint changes, no FTS index changes, no vector index changes. The `apply_schema` step in `src/db/schema.rs` is unchanged. Old v1-indexed workspaces remain valid (they simply lack v2 nodes/edges until re-indexed).
+All additions are pure label / property additions at the Neo4j layer; no constraint changes, no FTS index changes, no vector index changes. The `apply_schema` step in `src/db/schema.rs` is unchanged. `schema_version` stays at **1**.
 
-`schema_version` stays at **1**. The data model is forward-compatible at every layer.
+For details of the Rust ↔ Neo4j compatibility story (adding `UnresolvedRef.scope_qid` as a new field, v1 records lacking it), see §4.3.
 
 ---
 
@@ -140,8 +142,20 @@ New queries in `src/extraction/languages/daml.scm` (illustrative; the implemente
 ; Haskell parses these as `signature` nodes (or `top_splice/infix` in some Daml
 ; variants — slice 5/6 found Daml's single-colon `:` lands in `top_splice/infix`).
 ; The implementer must verify the actual subtree shape.
+;
+; CRITICAL: this query shape ALSO matches top-level function signatures
+; (`helperFn : Int -> Int`). The Function extractor in pass 2 already captures
+; those. To distinguish a Field from a top-level signature, the extractor MUST
+; check the ancestor chain at emit time: only emit as Field if the signature
+; node has a Template / Choice / Interface / Exception keyword-anchored
+; `(apply)` somewhere in its ancestor chain (i.e., it sits inside a with-block
+; under a Daml-anchored construct). Top-level signatures keep their existing
+; Function-tied behavior. Pass 3 must NOT emit Fields for signatures that
+; pass 2 already paired with a Function.
 (signature name: (variable) @field.name type: (_) @field.type) @field.def
 ```
+
+**Curried `apply` shape.** Haskell parses multi-argument applications left-associatively: `template Counter with owner: Party where ...` produces a nested chain like `(apply (apply (apply (variable "template") (constructor "Counter")) (where_block ...)) ...)`. The keyword-anchor queries above implicitly rely on tree-sitter's pattern matcher walking the tree until it finds a match — so an `(apply function: (variable "template") argument: (constructor) @template.name)` pattern matches at the **innermost** apply in the chain (the one where `template` is directly applied to its first argument). The implementer must verify by capturing real fixture parses and confirm the match position; if patterns fail to match because they expected the outermost apply, adjust by anchoring at the leftmost-variable apply with a `descendant` traversal in the query.
 
 Pass ordering inside `extract_daml` (the implementer assigns concrete names; the slice 9 codebase uses an idiosyncratic mix of `pass_a`/`pass_b`/`pass_c`/`pass_d`):
 
@@ -192,6 +206,27 @@ Additional queries:
 
 Each match emits an `UnresolvedRef { kind: <Signatory|Controller|Observer|Implements|Requires>, unresolved_name: <target_text>, source_qid: <Template|Choice|Interface qid>, scope_qid: Some(<enclosing-template-qid>) }`. The `scope_qid` is new — see §4.1.
 
+**Multi-party expression decomposition (Signatory / Controller / Observer).** Real Daml uses several expression shapes for parties:
+
+| Daml expression | Decomposition |
+|---|---|
+| `signatory owner` | One ref: `unresolved_name = "owner"` |
+| `signatory [owner, delegate]` | Two refs: `"owner"` and `"delegate"` |
+| `signatory $ Set.fromList [a, b]` | Two refs: `"a"` and `"b"` (the `Set.fromList` and `$` are dropped; identifiers inside the list are extracted) |
+| `signatory $ fromOptional [] mObservers` | One ref: `"mObservers"` (single identifier inside the optional) |
+| `signatory (parties config)` | One ref: `"config"` (or `"parties"`, depending on which the extractor prefers — see below) |
+| `signatory (owner :: signatories)` | Two refs: `"owner"` and `"signatories"` |
+
+Concretely, after matching the keyword-anchored `(apply)`, the extractor runs a sub-walk over the `@target` subtree:
+
+1. Collect every `(variable)` and `(constructor)` leaf inside the subtree.
+2. Filter out known wrapper identifiers: `Set.fromList`, `Set.singleton`, `fromOptional`, `fromSome`, `concat`, `concatMap`, the `$` operator (it's actually parsed as an operator, not a variable), and list/tuple syntactic nodes.
+3. For each remaining identifier, emit one `UnresolvedRef` with `unresolved_name` = that identifier's text. All refs share the same `source_qid` and `scope_qid`; they only differ in line/col.
+
+For `parties config` (a function call), this rule emits **both** "parties" and "config" — the resolver's Phase A.5 + Phase C will resolve each independently. False positives (e.g., resolving `parties` to a workspace-wide helper function) get the edge, but the relevant `config` ref also gets resolved, so the graph still answers "who can exercise this?" correctly. Document this as acceptable v2.0 precision; tighter decomposition is a v2.1 refinement.
+
+`Implements` and `Requires` follow the simpler single-identifier model since their argument is always a single `(constructor)`.
+
 ### 3.4 Why this is strictly better than regex Pass D
 
 | Aspect | Regex (v1) | Tree-sitter (v2) |
@@ -213,16 +248,18 @@ Each match emits an `UnresolvedRef { kind: <Signatory|Controller|Observer|Implem
 Slice 10b adds an `Option<String> scope_qid` field to `UnresolvedRef`. For party-edge kinds (Signatory, Controller, Observer), `scope_qid` is the enclosing Template's qid. Resolution adds a new phase that runs *before* Phase B's import-driven match:
 
 **Phase A.5 — Scoped name match (new).**
-For each `UnresolvedRef` with `scope_qid: Some(s)`, look up `<s>.<unresolved_name>` in the Symbol set. If found, emit the appropriate edge directly. If not, fall through to Phase B/C as before.
+For each `UnresolvedRef` with `scope_qid: Some(s)`, look up `<s>.<unresolved_name>` in the Symbol set. If found, emit the appropriate edge directly. If not, fall through to **Phase C only** (party kinds skip Phase B's import-driven match — party names are always local scope, never workspace-imported).
 
-For `Implements` / `Requires` kinds, `scope_qid` is `None` — they resolve against workspace-wide Interface symbols by qualified_name, the same shape as `IMPORTS` resolution.
+**Algorithm.** Phase A.5 builds a `HashMap<String, String>` once (mapping `qualified_name` → `qid`) by issuing one Cypher `MATCH (s:Symbol) RETURN s.qualified_name AS qname, s.qid AS qid` at phase start. Each subsequent ref lookup is `O(1)` against the map. Total cost: one Cypher per resolve invocation, regardless of ref count. This is cheaper than Phase C's existing per-ref name-match and amortizes well even for small workspaces.
+
+For `Implements` / `Requires` kinds, `scope_qid` is `None` — they resolve against workspace-wide Interface symbols by qualified_name, the same shape as `IMPORTS` resolution (also a Phase A-style lookup).
 
 ### 4.2 Phase assignments
 
 | UnresolvedKind | Resolution phases tried (in order) |
 |---|---|
-| `Signatory`, `Controller`, `Observer` | Phase A.5 (scoped) → Phase C (fallback workspace name-match) |
-| `Implements`, `Requires` | Phase A-shape (qualified_name lookup of an Interface node) |
+| `Signatory`, `Controller`, `Observer` | Phase A.5 (scoped HashMap lookup) → Phase C (fallback workspace name-match). Phase B is intentionally skipped — party names are scope-local, not workspace-imported. |
+| `Implements`, `Requires` | Phase A-shape (qualified_name lookup of an Interface node, same shape as `IMPORTS`). No fallback — if an unknown interface name is referenced, the edge stays unresolved (existing behavior for unknown qualified names). |
 
 ### 4.3 Backwards compatibility
 
@@ -285,6 +322,8 @@ exception InsufficientBalance with
     message "Insufficient balance"
 ```
 
+> **Daml version compatibility.** The `interface instance I for T where ...` syntax inside a template body is the Daml 2.7+ form (pre-2.7 used a separate top-level `instance` declaration). The fixture targets 2.7+ syntax. **Slice 10a Task 1 includes a verification step**: attempt to compile the fixture with the local `daml` compiler (if installed) or paste it into Daml Studio. If the compiler rejects it, switch to the pre-2.7 top-level form and update the fixture inline before proceeding. The extractor changes (tree-sitter queries) are insensitive to which form is used as long as the `interface instance` keyword sequence is in the source — only the IMPLEMENTS-edge source-side computation changes (sourced from Template's nested where-block in 2.7+, sourced from a top-level declaration node in 2.6 and earlier).
+
 Per-slice-10a expectations (asserted by the integration test):
 
 - 1 new Module (`Splice.Authorization`).
@@ -299,7 +338,7 @@ Per-slice-10a expectations (asserted by the integration test):
 
 Following slices 5-9's pattern, append to `tests/extraction_unit.rs`.
 
-**Slice 10a (~10 tests):**
+**Slice 10a (10 tests):**
 
 - `daml_extracts_interface_name_and_qualified_name`
 - `daml_extracts_viewtype_inside_interface_scope`
@@ -309,8 +348,10 @@ Following slices 5-9's pattern, append to `tests/extraction_unit.rs`.
 - `daml_byte_precise_template_span` — Template start/end lines match actual AST extent, not regex line block
 - `daml_pass_d_replaces_regex_no_regression` — comprehensive: indexes Counter.daml fixture from slice 9 and verifies counts match prior slice 9 baseline (regression guard)
 - `daml_field_qualified_name_nests_under_template` — `Foo.Counter.owner`, not `Foo.owner`
+- `daml_field_qualified_name_nests_under_choice` — `Foo.Counter.Bump.delta` (4-segment qname when Choice has its own `with`-block)
+- `daml_top_level_signature_not_emitted_as_field` — disambiguation guard: `helperFn : Int -> Int` at top level remains a Function signature, NOT a stray Field
 
-**Slice 10b (~8 tests):**
+**Slice 10b (10 tests):**
 
 - `daml_signatory_emits_unresolved_ref_with_scope_qid`
 - `daml_controller_inside_choice_uses_choice_scope`
@@ -319,6 +360,9 @@ Following slices 5-9's pattern, append to `tests/extraction_unit.rs`.
 - `daml_requires_emits_interface_to_interface_ref`
 - `daml_signatory_resolves_to_template_field_in_phase_a5`
 - `daml_party_unresolved_ref_falls_through_to_phase_c_when_scoped_miss`
+- `daml_multi_party_list_decomposed` — `signatory [a, b]` emits two refs, not one
+- `daml_multi_party_set_fromlist_decomposed` — `signatory $ Set.fromList [a, b]` emits two refs; `Set.fromList` is filtered out
+- `daml_party_unwrapped_from_optional` — `signatory $ fromOptional [] mObservers` emits one ref for `mObservers`
 
 ### 5.3 Integration tests
 
