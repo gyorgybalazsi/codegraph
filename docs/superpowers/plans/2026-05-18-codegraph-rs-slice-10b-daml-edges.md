@@ -336,11 +336,11 @@ Search:
 grep -rn "UnresolvedRef {" src/ tests/
 ```
 
-Each construction will fail to compile with the new field. Add `scope_qid: None` to every existing construction. There are constructions in:
+Each construction will fail to compile with the new field. Add `scope_qid: None,` as the last field of every existing struct literal. Known sites:
 - `src/extraction/languages/daml.rs` (slice 9's pass_b_imports, pass_c_call_sites, pass_c_exercise_choices)
 - `src/extraction/languages/rust.rs` (slice 2's call-site extraction)
 
-For each, add `scope_qid: None,` as the last field.
+**The build is the safety net.** If `grep` misses any construction site (e.g., one inside a macro or written with `..Default::default()`), the next `cargo build` in Step 6 will surface a compile error pointing at the missed site. Add `scope_qid: None,` to whatever the compiler flags.
 
 - [ ] **Step 5: Update `write_unresolved_refs` in `src/db/write.rs`**
 
@@ -462,9 +462,11 @@ fn daml_extracts_controller_inside_choice() {
         .filter(|r| r.kind == UnresolvedKind::Controller).collect();
     assert_eq!(ctrls.len(), 1);
     assert_eq!(ctrls[0].unresolved_name, "owner");
-    let template_qid = &result.nodes.iter().find(|n| n.kind == NodeKind::Template).unwrap().qid;
-    assert_eq!(ctrls[0].scope_qid.as_deref(), Some(template_qid.as_str()),
-        "controller's scope_qid is the enclosing Template (not the Choice)");
+    // Controller scope_qid is the enclosing Choice (more specific). Phase A.5
+    // falls back to the parent Template if `<choice_qname>.<name>` misses.
+    let choice_qid = &result.nodes.iter().find(|n| n.kind == NodeKind::Choice).unwrap().qid;
+    assert_eq!(ctrls[0].scope_qid.as_deref(), Some(choice_qid.as_str()),
+        "controller's scope_qid is the enclosing Choice; Phase A.5 falls back to Template parent");
 }
 
 #[test]
@@ -682,15 +684,19 @@ fn pass_e_party_edges(
             let Some(template_qid) = template_qid else { continue };
             let template_qid = template_qid.to_string();
 
-            // source_qid for the ref differs by kind:
-            //   - signatory/observer: enclosing Template
-            //   - controller: enclosing Choice (the choice the controller belongs to)
-            let source_qid = if *kind == UnresolvedKind::Controller {
-                enclosing_choice_qid(&result.nodes, line, col)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| template_qid.clone())
+            // source_qid AND scope_qid depend on kind:
+            //   - signatory/observer: source = Template, scope = Template
+            //   - controller: source = Choice (the containing choice), scope = Choice
+            //     (Phase A.5 will fall back to the enclosing Template when
+            //     `<choice_qname>.<name>` misses — choices with `with` blocks
+            //     have Choice fields that controllers can reference.)
+            let (source_qid, scope_qid) = if *kind == UnresolvedKind::Controller {
+                match enclosing_choice_qid(&result.nodes, line, col).map(str::to_string) {
+                    Some(c) => (c.clone(), c),
+                    None => (template_qid.clone(), template_qid.clone()),
+                }
             } else {
-                template_qid.clone()
+                (template_qid.clone(), template_qid.clone())
             };
 
             // Walk the target subtree for identifier leaves.
@@ -710,7 +716,7 @@ fn pass_e_party_edges(
                     kind: *kind,
                     line: ref_line,
                     col: ref_col,
-                    scope_qid: Some(template_qid.clone()),
+                    scope_qid: Some(scope_qid.clone()),
                 });
                 result.edges.push(RawEdge {
                     from_qid: source_qid.clone(),
@@ -873,13 +879,27 @@ Run and document the shapes. `implements` may show up as `variable "interface"` 
 
 - [ ] **Step 3: Add `implements` and `requires` queries to `daml.scm`**
 
+**Write the queries to match the shapes Step 2 actually observed.** The examples below are placeholders for the most common shape; don't paste them blindly.
+
 Likely shapes:
 
 ```scheme
 ; Implements: `interface instance Bar for T where ...` (Daml 2.7+).
-; The `interface instance` keyword pair is followed by a constructor.
+; The `interface instance` keyword pair may parse as:
+;   - Two siblings (variable "interface", variable "instance") in an ERROR — Shape A
+;   - A nested apply chain (apply (variable "interface") (apply (variable "instance") (constructor)))
+;     in an ERROR — Shape B (likely, given slice 10a templates exhibited similar curried shapes)
+; Pick the query form matching Step 2's probe.
+
+; Shape A (flat siblings):
 ((apply
   function: (variable) @implements.kw
+  argument: (constructor) @implements.interface) @implements.def
+  (#eq? @implements.kw "instance"))
+
+; Shape B (nested):
+((apply
+  function: (apply argument: (variable) @implements.kw)
   argument: (constructor) @implements.interface) @implements.def
   (#eq? @implements.kw "instance"))
 
@@ -890,7 +910,7 @@ Likely shapes:
   (#eq? @requires.kw "requires"))
 ```
 
-Adapt to actual probe output. If the parse for `interface instance Bar for T` has `instance` as the keyword anchor with `Bar` as direct constructor argument, the query above works. If `for T` confuses the parse, more work needed.
+If Step 2's probe shows neither Shape A nor Shape B matches, write a custom query OR fall back to a pure Rust tree walk (the pattern slice 10a Task 6 used for Fields when the parse shapes were too irregular for SCM).
 
 - [ ] **Step 4: Add `pass_e_interface_edges` to `daml.rs`**
 
@@ -994,7 +1014,7 @@ cargo test 2>&1 | tail -5
 cargo test --test integration_daml_index 2>&1 | tail -3
 ```
 
-Expected: 133 tests pass (130 + 3 new).
+Expected: 139 tests pass (136 + 3 new).
 
 - [ ] **Step 7: REMOVE probe tests, then commit**
 
@@ -1042,11 +1062,22 @@ Then create the new file:
 //!
 //! For each UnresolvedRef with `kind` in {Signatory, Controller, Observer}:
 //!   - Look up `<scope_qid_qname>.<unresolved_name>` in the Symbol-by-qname map.
+//!   - For Controllers, falls back to parent-Template scope on miss.
 //!   - On hit: MERGE the corresponding edge (SIGNATORY/CONTROLLER/OBSERVER).
 //!
 //! For Implements/Requires: target is a workspace-wide Interface by qname.
 //!   - Look up any Interface whose qname equals or ends with `.<unresolved_name>`.
 //!   - On hit: MERGE the IMPLEMENTS/REQUIRES edge.
+//!
+//! **Idempotency caveat.** MERGE is idempotent for the same `(source, target)`
+//! pair, but if a Template's signatory expression changes from `owner` to
+//! `creator` and sync re-runs resolution, the OLD edge to the `owner` Field
+//! is not deleted — only the new edge to `creator` is added. The Template
+//! ends up with two SIGNATORY edges. This is a known limitation of the v1
+//! resolution model (spec §7 says "Resolution as idempotent rebuild" but
+//! Phase B/C have the same staleness issue with CALLS/REFERENCES edges).
+//! A v2.1 follow-up could prepend a DETACH-DELETE pass that clears all
+//! resolution-derived edges before rebuilding.
 
 use anyhow::{Context, Result};
 use neo4rs::query;
@@ -1079,13 +1110,31 @@ pub async fn run(conn: &Connection) -> Result<PhaseA5Stats> {
         let (cypher_text, edge_resolved) = match r.kind.as_str() {
             "Signatory" | "Controller" | "Observer" => {
                 // Scoped lookup: <scope_qname>.<name>.
+                //
+                // For Controllers, scope_qid is the enclosing Choice; if the
+                // scoped lookup misses, fall back one level to the parent
+                // Template's qname. The parent qname is the scope_qname with
+                // its last dotted segment stripped (`Foo.T.Bump` → `Foo.T`).
+                // Signatory/Observer always use Template scope, so no fallback
+                // hop is needed.
                 let Some(scope_qid) = &r.scope_qid else {
                     stats.unresolved += 1;
                     continue;
                 };
                 let scope_qname = scope_qid.split(':').skip(2).collect::<Vec<_>>().join(":");
-                let lookup_key = format!("{}.{}", scope_qname, r.unresolved_name);
-                let Some(target_qid) = qname_map.get(&lookup_key) else {
+                let primary_key = format!("{}.{}", scope_qname, r.unresolved_name);
+                let target_qid = qname_map.get(&primary_key).cloned().or_else(|| {
+                    // Fallback for Controllers: try the parent Template's scope.
+                    if r.kind == "Controller" {
+                        if let Some(idx) = scope_qname.rfind('.') {
+                            let parent_qname = &scope_qname[..idx];
+                            let fallback_key = format!("{}.{}", parent_qname, r.unresolved_name);
+                            return qname_map.get(&fallback_key).cloned();
+                        }
+                    }
+                    None
+                });
+                let Some(target_qid) = target_qid else {
                     stats.unresolved += 1;
                     continue;
                 };
@@ -1235,7 +1284,7 @@ cargo test 2>&1 | tail -5
 cargo test --test integration_daml_index 2>&1 | tail -3
 ```
 
-Expected: build clean, 133 tests still pass (no new tests; Phase A.5 is integration-tested in Task 7).
+Expected: build clean, 139 tests still pass (no new tests; Phase A.5 is integration-tested in Task 7).
 
 - [ ] **Step 4: Commit**
 
@@ -1365,16 +1414,23 @@ info!(
 Add the new counters:
 
 ```rust
+// The single info! line is too long to read in a terminal — split into
+// two logical lines (still emitted as two separate log records, which the
+// user sees as adjacent lines).
 info!(
-    "resolution stats: imports={}, calls(B/C)={}/{}, refs(B/C)={}/{}, types(B/C)={}/{}, \
-     party(sig/ctrl/obs)={}/{}/{}, iface(impl/req)={}/{}, ambiguous={}, no_candidate={}",
+    "resolution stats: imports={}, calls(B/C)={}/{}, refs(B/C)={}/{}, types(B/C)={}/{}",
     stats.imports_resolved,
     stats.calls_resolved_phase_b, stats.calls_resolved_phase_c,
     stats.refs_resolved_phase_b, stats.refs_resolved_phase_c,
     stats.types_resolved_phase_b, stats.types_resolved_phase_c,
+);
+info!(
+    "resolution stats (auth): party(sig/ctrl/obs)={}/{}/{}, iface(impl/req)={}/{}, \
+     ambiguous={}, no_candidate={}, party_unresolved={}",
     stats.signatory_resolved, stats.controller_resolved, stats.observer_resolved,
     stats.implements_resolved, stats.requires_resolved,
     stats.unresolved_ambiguous, stats.unresolved_no_candidate,
+    stats.party_unresolved,
 );
 ```
 
@@ -1390,7 +1446,7 @@ cargo test 2>&1 | tail -5
 cargo test --test integration_daml_index 2>&1 | tail -3
 ```
 
-Expected: 133 tests still pass (no new tests — orchestrator wiring is integration-tested in Task 7).
+Expected: 139 tests still pass (no new tests — orchestrator wiring is integration-tested in Task 7).
 
 - [ ] **Step 6: Commit**
 
@@ -1421,9 +1477,26 @@ interface Owned requires Authorizable where
 
 Place after the `data AuthorizableView = ...` block and before `template AuthorizedCounter`.
 
-- [ ] **Step 2: Extend the integration test assertions**
+> **Inherited assertions update required.** Adding `interface Owned` bumps the slice 10a `interface_count` from 1 to 2 and adds one more Field (`getOwnerParty`). Step 2 below updates those inherited assertions.
 
-Read `tests/integration_daml_index.rs`. Find the existing assertions block. Add:
+- [ ] **Step 2: Update inherited slice 10a count assertions**
+
+In `tests/integration_daml_index.rs`, find these existing assertions and update them:
+
+```rust
+// Was: assert_eq!(interface_count, 1, "expected 1 Interface (Authorizable)");
+assert_eq!(interface_count, 2, "expected 2 Interfaces (Authorizable, Owned)");
+```
+
+The `field_count >= 6` assertion stays (the count goes from 8 to 9, still satisfies the bound). The doc-comment breakdown above the field_count assertion should add a line:
+```
+//   - Owned interface: getOwnerParty                                       -> 1
+// New minimum guaranteed: 9.
+```
+
+- [ ] **Step 3: Extend the integration test assertions**
+
+Read `tests/integration_daml_index.rs`. Find the existing assertions block. After the inherited-update from Step 2, add:
 
 ```rust
 // New for slice 10b: authorization edges.
@@ -1483,7 +1556,7 @@ let owned_req: i64 = scalar(&conn,
 assert_eq!(owned_req, 1);
 ```
 
-- [ ] **Step 3: Verify SKIP path**
+- [ ] **Step 4: Verify SKIP path**
 
 ```bash
 cargo test --test integration_daml_index 2>&1 | tail -10
@@ -1491,7 +1564,7 @@ cargo test --test integration_daml_index 2>&1 | tail -10
 
 Expected: 1 test, SKIPs cleanly (no env vars), result ok.
 
-- [ ] **Step 4: Build + clippy + fmt**
+- [ ] **Step 5: Build + clippy + fmt**
 
 ```bash
 cargo build 2>&1 | tail -3
@@ -1500,9 +1573,9 @@ cargo fmt --check
 cargo test 2>&1 | tail -5
 ```
 
-Expected: 133 tests pass (no new unit tests; integration test still SKIPs).
+Expected: 139 tests pass (no new unit tests; integration test still SKIPs).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add tests/fixtures/tiny-daml/Splice/Authorization.daml tests/integration_daml_index.rs
@@ -1555,7 +1628,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Expected: 133 tests pass total.
+Expected: 139 tests pass total.
 
 - [ ] **Step 4: Commit and tag**
 
@@ -1580,7 +1653,7 @@ Expected tags include `slice-10b-daml-edges`. Full list:
 ## Slice 10b Done
 
 - [ ] `cargo build` clean
-- [ ] `cargo test` (no env vars) — 133 tests pass, all integration tests SKIP cleanly
+- [ ] `cargo test` (no env vars) — 139 tests pass, all integration tests SKIP cleanly
 - [ ] `CODEGRAPH_RS_TEST_NEO4J=1 cargo test -- --test-threads=1` — all tests pass, including extended `integration_daml_index` with new edge assertions
 - [ ] `CODEGRAPH_RS_TEST_NEO4J=1 CODEGRAPH_RS_TEST_EMBEDDINGS=1 cargo test -- --test-threads=1` — embeddings unchanged; new edge kinds visible to MCP traversal tools
 - [ ] Manual: in Neo4j Browser, on a real Daml workspace (Splice/daml-finance):
