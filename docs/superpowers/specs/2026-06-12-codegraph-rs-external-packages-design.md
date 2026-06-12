@@ -1,6 +1,6 @@
 # codegraph-rs — external-package references design
 
-**Status:** Approved (scope), awaiting implementation plan.
+**Status:** Implemented — slices 11a–11e on `main` (codegraph-rs PRs #16/#17/#18/#21/#22). See §6 for as-built deviations and §10 for coverage/limitations.
 **Baseline:** `main` @ `fa88834` (after PR #15 — Phase A/B import resolution fixed; `IMPORTS`/Phase-B cross-module calls now work within the indexed workspace).
 **Scope:** A general, package-aware layer so references into *external* dependency packages resolve. External symbols exist purely as resolution targets — excluded from embeddings and search.
 
@@ -171,10 +171,17 @@ External symbols are excluded from every value-bearing read surface; they exist 
 |---|---|---|
 | **11a — model + visibility** | `Package` node, `external` flag/`:External` label, qid namespace, schema v2 constraint, exclude-external filters in embed/search read-paths. No ingestion yet → no behavior change, but the surfaces are ready. | `slice-11a-package-model` |
 | **11b — DAR/DALF ingestion** | Vendor the canton-toolbox LF decoder (§3.2); `extern` pipeline stage; enumerate deps from `daml.yaml` + SDK package-db; walk LF `Package` for exported names/kinds; write external `Package`/`Module`/symbol stubs + `IN_PACKAGE`/`DEPENDS_ON`. | `slice-11b-dar-ingestion` |
-| **11c — package-qualified resolution** | Scope Phase A/B by `DEPENDS_ON`; exclude externals from Phase C; precedence rules. | `slice-11c-package-resolution` |
-| **11d — corpus validation** | Re-index splice; confirm the ~6,669 `no_candidate` stdlib calls bind to external `DA.*`; confirm externals absent from embeddings/search. | (validation, no tag) |
+| **11c — package-qualified resolution** | Dup-tolerant module lookup (prefer local, else external; never bail) + exclude externals from Phase C. | `slice-11c-package-resolution` |
+| **11d — implicit-Prelude (Phase D)** | Bind leftover `no_candidate` calls to external symbols in a curated implicit-Daml-module set (`DA.Internal.*`, `GHC.*`, template functions), unambiguous-only; runs after Phase C. | `slice-11d-implicit-prelude` |
+| **11e — re-export expansion** | `import M` also imports `M.Internal.*` (Daml's re-export convention); ingest the daml-script DAR. Binds the `Daml.Script` API. | `slice-11e-reexport-expansion` |
 
-Slice 11a is safe to ship alone (additive). 11b is the heaviest (the LF reader). 11c delivers the user-visible win.
+**As-built deviations from the original design.** Shipped slices are simpler than §3–§4's full model where that proved unnecessary:
+- **11b** enumerates DARs from a config list (`[external] dars`), not a `daml.yaml` walk — built DARs already bundle their full dependency closure (incl. daml-stdlib). The vendored decoder also makes the recursive LF `Expr` AST opaque (we need names, not bodies) to dodge prost's recursion limit.
+- **No local `Package` nodes / `DEPENDS_ON` edges** were needed. 11c resolves via a dup-tolerant global module lookup (local-first) rather than per-file package scoping; within-name external duplicates are interchangeable for name resolution. Full `DEPENDS_ON` scoping (§4.1) remains a precision refinement, not yet required.
+- **11d/11e** are additions beyond the original §6 plan, prompted by the §10 limitation analysis — they recovered the Prelude and Daml.Script buckets (see §10).
+- **No `schema_version` bump** (§2.4) — the strict-equality config gate would reject existing workspaces.
+
+Corpus validation ran per slice on `codegraph-splice` rather than as a separate slice.
 
 ---
 
@@ -203,16 +210,25 @@ This work intentionally precedes the graph-granularity cleanup discussed separat
 
 ---
 
-## 10. Known limitations (as-built after 11a–11c)
+## 10. Resolution coverage and remaining limitation
 
-Shipped slices resolve calls into **explicitly-imported external modules whose symbols are real top-level LF definitions**. Measured on `codegraph-splice` (172 DARs → 205 external packages, ~19.6k external symbols): Phase A `IMPORTS` 656 → 1,006, `import_resolved` calls 716 → 992, `no_candidate` 6,669 → 6,299.
+On `codegraph-splice` (172 app DARs + daml-script → 206 external packages, ~19k external symbols), cumulative `no_candidate` calls dropped **6,669 → 4,263 (−36%)** across the slices:
 
-The drop is modest because the remaining `no_candidate` calls fall into three buckets that the as-built design **cannot** bind, each needing disproportionate work for a capped payoff:
+| Mechanism | Slice | Binds |
+|---|---|---|
+| Explicitly-imported external modules | 11b/11c | `DA.Foldable.forA_`, `DA.Optional.fromOptional`, … |
+| Implicit-Prelude (Phase D) | 11d | `pure`, `show`, `map`, `exercise`, `create`, `view`, `abort`, … (~1,411 refs) |
+| Re-export expansion + daml-script | 11e | `Daml.Script` API: `submit`, `query`, `exerciseCmd`, `actAs`, `readAs`, `createCmd`, … |
 
-| Bucket | ~count | Why unbound | What it would take |
-|---|---:|---|---|
-| `Daml.Script` API (`submit`, `query`, `exerciseCmd`, `actAs`, `readAs`, `submitMustFail`) | ~2,056 | The **daml-script package is not ingested** — it's a dev/test dependency, not bundled in the app DARs under `daml/dars/`. | SDK-package-db enumeration (the deferred §3.1 SDK path) **and** re-export handling (below) — `Daml.Script` is itself a re-export aggregator. |
-| Prelude / GHC re-exports (`pure`, `map`, `show`) | ~700 | `Prelude` is a **re-export aggregator with 0 own symbols**; the real definitions live in `DA.Internal.Prelude` / `GHC.Base` / `GHC.Show`. No `import` statement exists (Daml auto-imports Prelude), and even with one the module exposes nothing. Some names are ambiguous (`map` ∈ `GHC.Base` *and* `DA.NonEmpty`). | Capture the LF **export / re-export graph** (which module re-exports which names) — significant decoder work — plus implicit-Prelude import. |
-| Data constructors & builtins (`Some`, `None`, `Party`, `ContractId`, `Int`) | ~1,400 | **Not top-level LF symbols at all** — constructors are part of a `data` decl, builtins are LF primitives. The ingestion walk (§3.2) emits only top-level definitions. | Out of reach without modelling constructors/builtins as distinct symbol kinds; arguably never worth it for resolution. |
+The three buckets the original analysis flagged: the **Prelude/GHC re-exports** bucket was solved by Phase D (curated implicit-module set, unambiguous-only); the **Daml.Script** bucket by ingesting its DAR plus the `M` ⇒ `M.Internal.*` re-export-expansion convention (LF has no re-export metadata, so the naming convention is the only recovery path). Both are scoped so they never unbind explicit/local resolutions.
 
-**Decision: stop at explicit-import resolution.** The clean, correct win (real `DA.*` bindings via explicit imports) is delivered; pushing further requires both SDK-package-db ingestion *and* LF export-graph capture, and a large share of the remainder (constructors/builtins) is structurally unbindable. The remaining `no_candidate` count is therefore expected, not a defect — it is dominated by Prelude/Script re-exports and LF builtins/constructors. Revisit only if a concrete need (e.g. "jump to the definition of `submit`") justifies the export-graph + SDK-ingestion effort.
+**Remaining limitation (the floor).** What's left is structurally unbindable and **out of scope**:
+
+| Bucket | ~count | Why |
+|---|---:|---|
+| Data constructors & builtins (`Some`, `None`, `Party`, `ContractId`, `Int`) | ~1,400 | Not top-level LF symbols — constructors belong to a `data` decl; builtins are LF primitives. The ingestion walk (§3.2) emits only top-level definitions, so there is nothing to bind to. |
+| Ambiguous / curation gaps | remainder | Names defined in >1 candidate module (skipped to avoid false bindings), or in modules outside the curated implicit set / not present in any ingested DAR. |
+
+Reaching constructors/builtins would mean modelling them as distinct symbol kinds — disproportionate for resolution value. The remaining `no_candidate` count is therefore expected, not a defect.
+
+**Caveat on the curated lists.** Phase D's implicit-module set and the re-export convention are heuristics tuned to the Daml SDK layout; an SDK reorganization could require updating them. Auto-resolving the daml-script DAR from `sdk-version` (SDK-package-db enumeration, §3.1) is a future convenience — today it's listed explicitly in `[external] dars`.
