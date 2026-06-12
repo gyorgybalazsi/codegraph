@@ -193,10 +193,26 @@ Slice 11a is safe to ship alone (additive). 11b is the heaviest (the LF reader).
 - **Unit (11b):** LF/DAR parser against a tiny committed fixture DAR (or DALF) — assert package-id, module list, and a few exported definition names/kinds. **Explicitly assert names resolve to readable strings** (guards the interned-name dereferencing, §3.2) and that re-parsing the same DAR is byte-stable (content-hash dedup).
 - **Unit/integration (3.1):** given a `daml.yaml` + multi-LF SDK package-db, only the pinned-LF `daml-stdlib`/`daml-prim` is ingested (no duplicate `DA.List` modules); `find_module_by_qualified_name` returns the single in-scope module rather than bailing.
 - **Integration (11a/11c, gated on `CODEGRAPH_RS_TEST_NEO4J`):** index `tiny-daml` plus a small external-package fixture; assert (a) local + external `Package` nodes and `IN_PACKAGE`/`DEPENDS_ON` edges (incl. implicit SDK dep); (b) external `Module` `CONTAINS` its symbols and a call into it resolves with `confidence: import_resolved`; (c) external symbols absent from `semantic_search`, keyword `search`, and the embedded set; (d) Phase C does not bind a bare local name to an external symbol; (e) an existing `schema_version = 1` config still loads (no version-bump regression).
-- **Corpus validation (11d):** on `codegraph-splice`, `no_candidate` calls drop sharply (stdlib refs bind); `pure`/`map`/`Some` resolve to external `DA.*`; embedded count unchanged from the local-only baseline.
+- **Corpus validation (11d):** on `codegraph-splice`, calls into **explicitly-imported** external modules bind (e.g. `DA.Foldable.forA_`, `DA.Optional.fromOptional`); `no_candidate` drops and `import_resolved` rises; embedded count unchanged from the local-only baseline. (The drop is partial — see §10 for the names that do *not* bind.)
 
 ---
 
 ## 9. Relationship to the deferred cleanup
 
 This work intentionally precedes the graph-granularity cleanup discussed separately (pruning inert `UnresolvedRef`/`Import` scaffolding). Resolving external refs converts a large fraction of today's `no_candidate`/`import` refs into edges, so the genuinely-inert remainder — the real cleanup target — is only well-defined *after* this lands. Re-measure then.
+
+---
+
+## 10. Known limitations (as-built after 11a–11c)
+
+Shipped slices resolve calls into **explicitly-imported external modules whose symbols are real top-level LF definitions**. Measured on `codegraph-splice` (172 DARs → 205 external packages, ~19.6k external symbols): Phase A `IMPORTS` 656 → 1,006, `import_resolved` calls 716 → 992, `no_candidate` 6,669 → 6,299.
+
+The drop is modest because the remaining `no_candidate` calls fall into three buckets that the as-built design **cannot** bind, each needing disproportionate work for a capped payoff:
+
+| Bucket | ~count | Why unbound | What it would take |
+|---|---:|---|---|
+| `Daml.Script` API (`submit`, `query`, `exerciseCmd`, `actAs`, `readAs`, `submitMustFail`) | ~2,056 | The **daml-script package is not ingested** — it's a dev/test dependency, not bundled in the app DARs under `daml/dars/`. | SDK-package-db enumeration (the deferred §3.1 SDK path) **and** re-export handling (below) — `Daml.Script` is itself a re-export aggregator. |
+| Prelude / GHC re-exports (`pure`, `map`, `show`) | ~700 | `Prelude` is a **re-export aggregator with 0 own symbols**; the real definitions live in `DA.Internal.Prelude` / `GHC.Base` / `GHC.Show`. No `import` statement exists (Daml auto-imports Prelude), and even with one the module exposes nothing. Some names are ambiguous (`map` ∈ `GHC.Base` *and* `DA.NonEmpty`). | Capture the LF **export / re-export graph** (which module re-exports which names) — significant decoder work — plus implicit-Prelude import. |
+| Data constructors & builtins (`Some`, `None`, `Party`, `ContractId`, `Int`) | ~1,400 | **Not top-level LF symbols at all** — constructors are part of a `data` decl, builtins are LF primitives. The ingestion walk (§3.2) emits only top-level definitions. | Out of reach without modelling constructors/builtins as distinct symbol kinds; arguably never worth it for resolution. |
+
+**Decision: stop at explicit-import resolution.** The clean, correct win (real `DA.*` bindings via explicit imports) is delivered; pushing further requires both SDK-package-db ingestion *and* LF export-graph capture, and a large share of the remainder (constructors/builtins) is structurally unbindable. The remaining `no_candidate` count is therefore expected, not a defect — it is dominated by Prelude/Script re-exports and LF builtins/constructors. Revisit only if a concrete need (e.g. "jump to the definition of `submit`") justifies the export-graph + SDK-ingestion effort.
