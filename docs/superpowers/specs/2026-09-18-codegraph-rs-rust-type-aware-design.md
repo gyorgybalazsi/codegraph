@@ -81,12 +81,18 @@ The Daml extractor sets both fields to the values it already records. `Unresolve
 
 The stage runs inside `index`, and inside `sync` when any `.rs` file changed. For each Rust `UnresolvedRef`:
 
-1. Find the token whose range contains the ref's `(name_line, name_col)`, converted to a byte offset. `StaticIndexedFile.tokens` is a `Vec<(TextRange, TokenId)>` per file, so the stage builds one sorted interval list per file and binary-searches it.
-2. Take that token's `definition`, which is a `FileRange` naming a file and a range.
-3. Find the codegraph symbol in that file whose span contains the definition's range, choosing the innermost when several do. The new `(:Symbol)` index over `root_name, relative_path` makes this a lookup rather than a scan.
+1. Find the analyzer token at the ref's `(name_line, name_col)`, converted to a byte offset. No lookup API exists, but none is needed: `StaticIndexedFile.tokens` is a `Vec<(TextRange, TokenId)>` whose ranges are the name token exactly, and both tools index by UTF-8 byte offset, so the stage builds a per-file `HashMap` keyed on `range.start()` and matches exactly.
+   - **Skip the whole-file module token.** Its range spans the file and starts at offset 0. rust-analyzer's own tests skip it (`static_index.rs:385`).
+   - **One range can carry two token ids.** `get_definitions` returns an `ArrayVec<_, 2>` (`static_index.rs:150`); field-init shorthand, as in `Point { x, y }`, makes `x` both a field and a local. The stage stores both, writes a target only when they agree on one definition, and counts the rest as unmapped.
+2. Take that token's `definition`, a `FileRange` naming a file and a range.
+3. Find the codegraph symbol in that file whose span contains the definition's range, choosing the innermost when several do. The new `(:Symbol)` index over `root_name, relative_path` makes this a lookup rather than a scan. Match by containment, never by span equality: `definition_body` keeps leading `///` doc comments (`static_index.rs:351`), while a tree-sitter item node starts after them.
 4. Write `target_qid` and `target_source = "type_exact"` on the ref.
 
-A ref the stage cannot map keeps no target, and its reason is counted. Refs whose definition lies outside the workspace resolve to nothing, which is correct: `StaticIndex::compute` visits no library source roots, so no `std` or dependency definition appears.
+A ref the stage cannot map keeps no target, and its reason is counted.
+
+**Three coverage limits, all measured in the sources.** `StaticIndex::compute` skips library source roots (`static_index.rs:274`), so a call to workspace code *from* `std` or a dependency never appears, which is what codegraph wants. It also skips a file belonging to no crate (`static_index.rs:176`), and a `cfg`-disabled module never reaches it at all. Refs in those files keep no target and fall back to name matching, counted as unmapped rather than silently dropped.
+
+The stage passes **`VendoredLibrariesConfig::Excluded`**. `Included { workspace_root }` would also index path dependencies inside the tree, which §4.2's discovery already loads as workspaces in their own right; indexing them twice would produce two definitions for one symbol.
 
 **Why the target is stored, not turned straight into an edge.** `resolve()` drops every confidence-bearing edge and rebuilds (`src/resolution/drop.rs:12`), and `sync` always calls it (`src/sync/mod.rs:176`). If Phase R only ran when Rust files changed, a Daml-only sync would delete every exact Rust edge and never rebuild it. Storing the target on the ref follows the v1 principle that an `UnresolvedRef` is the durable record of source-code intent, so any later `resolve()` rebuilds the same edges with no analyzer run.
 
@@ -155,7 +161,7 @@ Every test is written first and watched failing.
 
 **Unit, no external services.**
 - Position conversion, both directions, including the one-based-to-zero-based line shift and a multi-byte character in a line.
-- The interval lookup: a position inside a token, on a token's first byte, on its last byte, and between tokens.
+- The token lookup: a name position that matches a token start exactly; a position inside a token but not at its start, which must not match; the whole-file module token, which must be skipped; a range carrying two token ids, which must be counted as unmapped unless both agree.
 - Definition-to-symbol containment: one candidate; nested candidates, where the innermost wins; no candidate, which must be counted, not panic.
 - Workspace discovery over a fixture tree holding a root workspace, a member package and a second independent workspace in a subdirectory. Two manifests load, each once, in either walk order. This fixture is on disk, so the test is a fixture test rather than a pure unit test.
 
@@ -187,6 +193,7 @@ Assertions are counts tied to forms, not existence:
 - **Accepted, pilot, 2026-09-18: every sync touching Rust pays the analysis cost**, subject to the slice 2 gate.
 - **Accepted, pilot, 2026-09-18: tuple-struct fields stay unextracted.** They have no name to match, and no test can observe them.
 - **Open, owner: this session, gate: slice 3.** A SCIP run reported 48 references to `SequencerHandle::submit` where an LSP `references` run reported 39. Until the difference is explained, the fixture's exact counts stand as the contract and `alt-canton` numbers are reported as measurements only.
+- **Accepted, pilot, 2026-09-18: `cfg`-disabled code resolves by name match only.** rust-analyzer never analyses a module the active `cfg` flags exclude, so those refs keep no target. They are counted, not dropped.
 - **Open, owner: this session, gate: slice 2.** `StaticIndex::compute` computes hover for every definition unconditionally (`static_index.rs:205`), with no configuration knob. Slice 2's measurement decides whether that is affordable; if it is not, the alternative is the rejected subprocess approach, which pays the same cost in another process.
 
 ## 8. What verification changed
